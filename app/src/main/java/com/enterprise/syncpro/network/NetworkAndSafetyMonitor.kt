@@ -94,41 +94,41 @@ class NetworkAndSafetyMonitor private constructor(private val context: Context) 
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             .build()
 
-        connectivityManager.registerNetworkCallback(
-            request,
-            object : ConnectivityManager.NetworkCallback() {
-                override fun onAvailable(network: Network) {
-                    scope.launch {
-                        refreshNetworkInterfaces()
-                        _networkHandoverEpoch.value = System.currentTimeMillis()
-                    }
-                }
-
-                override fun onCapabilitiesChanged(
-                    network: Network,
-                    networkCapabilities: NetworkCapabilities
-                ) {
-                    scope.launch {
-                        _isOnWifi.value = networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                            val wifiInfo = networkCapabilities.transportInfo as? WifiInfo
-                            val ssid = wifiInfo?.ssid?.removeSurrounding("\"")
-                            if (!ssid.isNullOrBlank() && ssid != "<unknown ssid>") {
-                                _currentSsid.value = ssid
-                            }
-                        }
-                        refreshNetworkInterfaces()
-                    }
-                }
-
-                override fun onLost(network: Network) {
-                    scope.launch {
-                        refreshNetworkInterfaces()
-                        _networkHandoverEpoch.value = System.currentTimeMillis()
-                    }
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                scope.launch {
+                    refreshNetworkInterfaces()
+                    _networkHandoverEpoch.value = System.currentTimeMillis()
                 }
             }
-        )
+
+            override fun onCapabilitiesChanged(
+                network: Network,
+                networkCapabilities: NetworkCapabilities
+            ) {
+                scope.launch {
+                    val isWifi = networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+                    _isOnWifi.value = isWifi
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        val wifiInfo = networkCapabilities.transportInfo as? WifiInfo
+                        val ssid = wifiInfo?.ssid?.removeSurrounding("\"")
+                        if (!ssid.isNullOrBlank() && ssid != "<unknown ssid>") {
+                            _currentSsid.value = ssid
+                        }
+                    }
+                    refreshNetworkInterfaces()
+                }
+            }
+
+            override fun onLost(network: Network) {
+                scope.launch {
+                    refreshNetworkInterfaces()
+                    _networkHandoverEpoch.value = System.currentTimeMillis()
+                }
+            }
+        }
+
+        connectivityManager.registerNetworkCallback(request, callback)
     }
 
     /**
@@ -159,11 +159,33 @@ class NetworkAndSafetyMonitor private constructor(private val context: Context) 
             _localLanIp.value = foundLan
             _tailscaleIp.value = foundTailscale
 
-            // Fallback SSID lookup via WifiManager
-            @Suppress("DEPRECATION")
-            val legacySsid = wifiManager.connectionInfo?.ssid?.removeSurrounding("\"")
-            if (!legacySsid.isNullOrBlank() && legacySsid != "<unknown ssid>") {
-                _currentSsid.value = legacySsid
+            // Active network capabilities check
+            val activeNet = connectivityManager.activeNetwork
+            val caps = connectivityManager.getNetworkCapabilities(activeNet)
+            val isWifi = caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+            _isOnWifi.value = isWifi
+
+            var detectedSsid: String? = null
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && caps != null) {
+                val wifiInfo = caps.transportInfo as? WifiInfo
+                val ssid = wifiInfo?.ssid?.removeSurrounding("\"")
+                if (!ssid.isNullOrBlank() && ssid != "<unknown ssid>") {
+                    detectedSsid = ssid
+                }
+            }
+
+            if (detectedSsid == null) {
+                @Suppress("DEPRECATION")
+                val legacySsid = wifiManager.connectionInfo?.ssid?.removeSurrounding("\"")
+                if (!legacySsid.isNullOrBlank() && legacySsid != "<unknown ssid>") {
+                    detectedSsid = legacySsid
+                }
+            }
+
+            if (detectedSsid != null) {
+                _currentSsid.value = detectedSsid
+            } else if (!isWifi) {
+                _currentSsid.value = null
             }
         }
     }
@@ -212,8 +234,11 @@ class NetworkAndSafetyMonitor private constructor(private val context: Context) 
     fun isTrustedWifiAllowed(restrictEnabled: Boolean, trustedSsids: Set<String>): Boolean {
         if (!restrictEnabled || trustedSsids.isEmpty()) return true
         if (!_isOnWifi.value) return false
-        val activeSsid = _currentSsid.value?.removeSurrounding("\"") ?: return false
-        return trustedSsids.any { it.equals(activeSsid, ignoreCase = true) }
+        val activeSsid = _currentSsid.value?.removeSurrounding("\"")
+        if (activeSsid != null) {
+            return trustedSsids.any { it.equals(activeSsid, ignoreCase = true) }
+        }
+        return trustedSsids.any { it.equals("Wi-Fi", ignoreCase = true) || it.equals("Any Wi-Fi", ignoreCase = true) }
     }
 
     /**

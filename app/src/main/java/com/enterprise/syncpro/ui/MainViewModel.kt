@@ -54,10 +54,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     val telemetry: StateFlow<TransferLiveTelemetry> = relayEngine.telemetry
     val safetyStatus: StateFlow<HardwareSafetyStatus> = networkMonitor.safetyStatus
+    val uploadQueue: StateFlow<List<RelayQueueTask>> = relayEngine.uploadQueue
     val discoveredHubs: StateFlow<List<DiscoveredHubEndpoint>> = networkMonitor.discoveredHubs
     val localLanIp: StateFlow<String> = networkMonitor.localLanIp
     val tailscaleIp: StateFlow<String?> = networkMonitor.tailscaleIp
     val currentSsid: StateFlow<String?> = networkMonitor.currentSsid
+    val isOnWifi: StateFlow<Boolean> = networkMonitor.isOnWifi
 
     val syncedLocalCount: StateFlow<Int> = dao.observeSyncedCount()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
@@ -270,6 +272,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun togglePauseResume() {
         relayEngine.togglePause()
+    }
+
+    fun stopSync() {
+        relayEngine.clearQueueAndStop()
+        _uiToastMessage.value = "Sync Stopped & Upload Queue Cleared"
+    }
+
+    fun removeFromQueue(filePath: String) {
+        relayEngine.removeTaskFromQueue(filePath)
+    }
+
+    fun reprioritizeInQueue(filePath: String, newPriority: Int) {
+        relayEngine.reprioritizeTask(filePath, newPriority)
     }
 
     fun toggleBucketSelection(bucketName: String, enabled: Boolean) {

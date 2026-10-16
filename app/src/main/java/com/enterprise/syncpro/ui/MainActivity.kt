@@ -29,9 +29,12 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -54,10 +57,13 @@ import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.Dashboard
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Hub
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Pause
@@ -132,19 +138,47 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import com.enterprise.syncpro.data.DeviceRole
+import com.enterprise.syncpro.data.HubDeduplicationEntity
 import com.enterprise.syncpro.media.MediaBucketSummary
 import com.enterprise.syncpro.media.QrCodeCameraAnalyzer
+import com.enterprise.syncpro.network.RelayQueueTask
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.media.ThumbnailUtils
+import android.provider.MediaStore
+import android.util.Size
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.Movie
+import androidx.compose.material.icons.filled.OpenInNew
+import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Visibility
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
 import kotlin.math.roundToInt
 
+data class PreviewMediaData(
+    val title: String,
+    val filePath: String? = null,
+    val contentUri: String? = null,
+    val fileSize: Long = 0L,
+    val bucketOrSource: String = "",
+    val sha256: String? = null,
+    val timestamp: Long = 0L
+)
+
 private enum class BottomNavTab(val title: String) {
     DASHBOARD("Dashboard"),
     FOLDERS("Folders"),
+    QUEUE("Queue"),
     NETWORK("Network")
 }
 
@@ -256,6 +290,7 @@ private fun SyncProRootScreen(
     var showAboutModal by rememberSaveable { mutableStateOf(false) }
     var showConfigBackupDialog by rememberSaveable { mutableStateOf(false) }
     var showDiagnosticLogsDialog by rememberSaveable { mutableStateOf(false) }
+    var previewMediaItem by remember { mutableStateOf<PreviewMediaData?>(null) }
 
     val showFirstLaunchOnboarding by viewModel.showFirstLaunchOnboarding.collectAsState()
     val isDarkMode by viewModel.isDarkMode.collectAsState()
@@ -309,6 +344,13 @@ private fun SyncProRootScreen(
         DiagnosticLogsModal(
             viewModel = viewModel,
             onDismiss = { showDiagnosticLogsDialog = false }
+        )
+    }
+
+    previewMediaItem?.let { item ->
+        MediaPreviewDialog(
+            media = item,
+            onDismiss = { previewMediaItem = null }
         )
     }
 
@@ -433,7 +475,7 @@ private fun SyncProRootScreen(
                     selected = false,
                     icon = { Icon(Icons.Default.Code, contentDescription = null) },
                     onClick = {
-                        openExternalUrl(context, "https://github.com/your-org/sync-pro-android")
+                        openExternalUrl(context, "https://github.com/sivaprasad2003/SyncPro")
                         scope.launch { drawerState.close() }
                     }
                 )
@@ -509,6 +551,12 @@ private fun SyncProRootScreen(
                         label = { Text("Folders") }
                     )
                     NavigationBarItem(
+                        selected = selectedTab == BottomNavTab.QUEUE,
+                        onClick = { selectedTab = BottomNavTab.QUEUE },
+                        icon = { Icon(Icons.Default.Sync, contentDescription = "Queue") },
+                        label = { Text("Queue") }
+                    )
+                    NavigationBarItem(
                         selected = selectedTab == BottomNavTab.NETWORK,
                         onClick = { selectedTab = BottomNavTab.NETWORK },
                         icon = { Icon(Icons.Default.Wifi, contentDescription = "Network") },
@@ -525,9 +573,17 @@ private fun SyncProRootScreen(
                 when (selectedTab) {
                     BottomNavTab.DASHBOARD -> DashboardScreen(
                         viewModel = viewModel,
-                        onRequestBatteryExemption = onRequestIgnoreBatteryOptimizations
+                        onRequestBatteryExemption = onRequestIgnoreBatteryOptimizations,
+                        onPreviewMedia = { previewMediaItem = it }
                     )
-                    BottomNavTab.FOLDERS -> FoldersScreen(viewModel = viewModel)
+                    BottomNavTab.FOLDERS -> FoldersScreen(
+                        viewModel = viewModel,
+                        onPreviewMedia = { previewMediaItem = it }
+                    )
+                    BottomNavTab.QUEUE -> UploadQueueScreen(
+                        viewModel = viewModel,
+                        onPreviewMedia = { previewMediaItem = it }
+                    )
                     BottomNavTab.NETWORK -> NetworkAndVaultScreen(
                         viewModel = viewModel,
                         onLaunchBiometricPrompt = onLaunchBiometricPrompt
@@ -541,7 +597,8 @@ private fun SyncProRootScreen(
 @Composable
 private fun DashboardScreen(
     viewModel: MainViewModel,
-    onRequestBatteryExemption: () -> Unit
+    onRequestBatteryExemption: () -> Unit,
+    onPreviewMedia: (PreviewMediaData) -> Unit
 ) {
     val context = LocalContext.current
     val role by viewModel.deviceRole.collectAsState()
@@ -696,16 +753,16 @@ private fun DashboardScreen(
                     // Action Buttons
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Button(
                             onClick = { viewModel.startFullBatchSyncNow() },
                             modifier = Modifier.weight(1f),
                             colors = ButtonDefaults.buttonColors(containerColor = EmeraldNeon)
                         ) {
-                            Icon(Icons.Default.Sync, contentDescription = null, tint = Color.Black)
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Sync Now", color = Color.Black, fontWeight = FontWeight.Bold)
+                            Icon(Icons.Default.Sync, contentDescription = null, tint = Color.Black, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Sync Now", color = Color.Black, fontWeight = FontWeight.Bold, maxLines = 1)
                         }
 
                         OutlinedButton(
@@ -715,12 +772,35 @@ private fun DashboardScreen(
                             Icon(
                                 imageVector = if (telemetry.isPaused) Icons.Default.PlayArrow else Icons.Default.Pause,
                                 contentDescription = null,
-                                tint = Color.White
+                                tint = Color.White,
+                                modifier = Modifier.size(16.dp)
                             )
-                            Spacer(modifier = Modifier.width(6.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
                             Text(
                                 text = if (telemetry.isPaused) "Resume" else "Pause",
-                                color = Color.White
+                                color = Color.White,
+                                maxLines = 1
+                            )
+                        }
+
+                        OutlinedButton(
+                            onClick = { viewModel.stopSync() },
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = CrimsonAlert),
+                            border = BorderStroke(1.dp, CrimsonAlert.copy(alpha = 0.7f))
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Stop,
+                                contentDescription = null,
+                                tint = CrimsonAlert,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = "Stop",
+                                color = CrimsonAlert,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1
                             )
                         }
                     }
@@ -798,11 +878,13 @@ private fun DashboardScreen(
                     ) {
                         Text(
                             text = "Thermal, Battery & Doze Safety Guards",
-                            style = MaterialTheme.typography.titleMedium
+                            style = MaterialTheme.typography.titleMedium,
+                            modifier = Modifier.weight(1f)
                         )
+                        Spacer(modifier = Modifier.width(8.dp))
                         AssistChip(
                             onClick = onRequestBatteryExemption,
-                            label = { Text("Exempt Doze") }
+                            label = { Text("Exempt Doze", maxLines = 1) }
                         )
                     }
                     Spacer(modifier = Modifier.height(8.dp))
@@ -836,7 +918,7 @@ private fun DashboardScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Column {
+                        Column(modifier = Modifier.weight(1f)) {
                             Text(
                                 text = "Daily Automated Sync Schedule",
                                 style = MaterialTheme.typography.titleMedium
@@ -852,6 +934,7 @@ private fun DashboardScreen(
                                 color = MaterialTheme.colorScheme.primary
                             )
                         }
+                        Spacer(modifier = Modifier.width(8.dp))
                         Button(
                             onClick = {
                                 TimePickerDialog(
@@ -865,8 +948,8 @@ private fun DashboardScreen(
                                 ).show()
                             }
                         ) {
-                            Icon(Icons.Default.Schedule, contentDescription = null)
-                            Spacer(modifier = Modifier.width(6.dp))
+                            Icon(Icons.Default.Schedule, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
                             Text(String.format(Locale.US, "%02d:%02d", scheduleHour, scheduleMinute))
                         }
                     }
@@ -892,22 +975,35 @@ private fun DashboardScreen(
                         steps = 19
                     )
 
-                    // Priority Weight Selector (1..5)
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
+                    // Priority Weight Selector (1..5) — scrollable row to prevent overflow
+                    Column(
+                        modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text(
-                            text = "Device PriorityQueue Weight (1-5)",
-                            style = MaterialTheme.typography.bodyMedium
-                        )
-                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Device PriorityQueue Weight",
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                            Text(
+                                text = "Weight: $priorityWeight",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = EmeraldNeon
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Row(
+                            modifier = Modifier.horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
                             (1..5).forEach { weight ->
                                 FilterChip(
                                     selected = priorityWeight == weight,
                                     onClick = { viewModel.updateDevicePriorityWeight(weight) },
-                                    label = { Text("$weight") }
+                                    label = { Text(if (weight == 5) "5 (Max)" else "$weight") }
                                 )
                             }
                         }
@@ -946,33 +1042,75 @@ private fun DashboardScreen(
             }
             items(recentHubFiles.take(10), key = { it.sha256 }) { entry ->
                 Card(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable {
+                            onPreviewMedia(
+                                PreviewMediaData(
+                                    title = entry.finalFileName,
+                                    contentUri = entry.savedUri,
+                                    fileSize = entry.fileSize,
+                                    bucketOrSource = entry.sourceDevice,
+                                    sha256 = entry.sha256,
+                                    timestamp = entry.receivedAt
+                                )
+                            )
+                        },
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
                 ) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(12.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier
+                                .size(40.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(IndigoNeon.copy(alpha = 0.15f))
+                        ) {
+                            Icon(
+                                imageVector = if (entry.finalFileName.substringAfterLast('.', "").lowercase() in setOf("mp4", "mov", "mkv", "webm", "3gp")) {
+                                    Icons.Default.Movie
+                                } else {
+                                    Icons.Default.Image
+                                },
+                                contentDescription = "Preview",
+                                tint = EmeraldNeon,
+                                modifier = Modifier.size(22.dp)
+                            )
+                        }
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
                                 text = entry.finalFileName,
                                 style = MaterialTheme.typography.bodyMedium,
-                                fontWeight = FontWeight.SemiBold
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
                             Text(
                                 text = "SHA-256: ${entry.sha256.take(16)}... • From ${entry.sourceDevice}",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
                         }
-                        Text(
-                            text = formatBytes(entry.fileSize),
-                            style = MaterialTheme.typography.labelSmall,
-                            color = EmeraldNeon
-                        )
+                        Column(horizontalAlignment = Alignment.End) {
+                            Text(
+                                text = formatBytes(entry.fileSize),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = EmeraldNeon
+                            )
+                            Text(
+                                text = "Tap to view",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+                            )
+                        }
                     }
                 }
             }
@@ -981,7 +1119,10 @@ private fun DashboardScreen(
 }
 
 @Composable
-private fun FoldersScreen(viewModel: MainViewModel) {
+private fun FoldersScreen(
+    viewModel: MainViewModel,
+    onPreviewMedia: (PreviewMediaData) -> Unit
+) {
     val buckets by viewModel.mediaBuckets.collectAsState()
     val enabledBuckets by viewModel.enabledBuckets.collectAsState()
 
@@ -1005,7 +1146,7 @@ private fun FoldersScreen(viewModel: MainViewModel) {
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "Check folders for automated background syncing, or tap 'Upload Immediately' to dispatch Express Priority-5 packets that jump ahead of the batch queue.",
+                        text = "Check folders for automated background syncing, or tap 'Upload Immediately' to dispatch Express Priority-5 packets that jump ahead of the batch queue. Tap any file to preview.",
                         style = MaterialTheme.typography.bodyMedium
                     )
                 }
@@ -1025,7 +1166,8 @@ private fun FoldersScreen(viewModel: MainViewModel) {
                 },
                 onInstantUploadSingleFile = { singleTask ->
                     viewModel.triggerUrgentInstantUpload(listOf(singleTask), singleTask.fileName)
-                }
+                },
+                onPreviewMedia = onPreviewMedia
             )
         }
     }
@@ -1037,7 +1179,8 @@ private fun FolderBucketCard(
     isChecked: Boolean,
     onCheckedChange: (Boolean) -> Unit,
     onInstantUploadFolder: () -> Unit,
-    onInstantUploadSingleFile: (com.enterprise.syncpro.network.RelayQueueTask) -> Unit
+    onInstantUploadSingleFile: (com.enterprise.syncpro.network.RelayQueueTask) -> Unit,
+    onPreviewMedia: (PreviewMediaData) -> Unit
 ) {
     var expanded by rememberSaveable { mutableStateOf(false) }
 
@@ -1062,47 +1205,85 @@ private fun FolderBucketCard(
                 ) {
                     Text(
                         text = summary.bucketName,
-                        style = MaterialTheme.typography.titleMedium
+                        style = MaterialTheme.typography.titleMedium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                     Text(
-                        text = "${summary.relativePathHint} • ${summary.fileCount} files (${formatBytes(summary.totalBytes)})",
+                        text = "${summary.fileCount} files • ${formatBytes(summary.totalBytes)}",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
+                Spacer(modifier = Modifier.width(8.dp))
                 Button(
                     onClick = onInstantUploadFolder,
-                    colors = ButtonDefaults.buttonColors(containerColor = IndigoNeon)
+                    colors = ButtonDefaults.buttonColors(containerColor = IndigoNeon),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                        horizontal = 10.dp, vertical = 6.dp
+                    )
                 ) {
-                    Icon(Icons.Default.Bolt, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("Upload Now", style = MaterialTheme.typography.labelSmall)
+                    Icon(
+                        Icons.Default.Bolt,
+                        contentDescription = null,
+                        modifier = Modifier.size(14.dp)
+                    )
+                    Spacer(modifier = Modifier.width(3.dp))
+                    Text(
+                        "Upload",
+                        style = MaterialTheme.typography.labelSmall,
+                        maxLines = 1
+                    )
                 }
             }
 
             if (expanded && summary.sampleFiles.isNotEmpty()) {
                 HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
                 Text(
-                    text = "Tap any file for Urgent Priority-5 Queue-Jump:",
+                    text = "Tap any file for Urgent Priority-5 Queue-Jump (or preview):",
                     style = MaterialTheme.typography.labelSmall,
                     color = EmeraldNeon
                 )
                 Spacer(modifier = Modifier.height(6.dp))
                 summary.sampleFiles.take(6).forEach { fileTask ->
+                    val isVid = fileTask.fileName.substringAfterLast('.', "").lowercase() in
+                            setOf("mp4", "mov", "mkv", "webm", "3gp")
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
+                            .clickable {
+                                onPreviewMedia(
+                                    PreviewMediaData(
+                                        title = fileTask.fileName,
+                                        filePath = fileTask.filePath,
+                                        fileSize = fileTask.fileSize,
+                                        bucketOrSource = fileTask.bucketName,
+                                        timestamp = fileTask.lastModified
+                                    )
+                                )
+                            }
                             .padding(vertical = 4.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(
-                            text = "${fileTask.fileName} (${formatBytes(fileTask.fileSize)})",
-                            style = MaterialTheme.typography.bodyMedium,
+                        Row(
                             modifier = Modifier.weight(1f),
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Icon(
+                                imageVector = if (isVid) Icons.Default.Movie else Icons.Default.Image,
+                                contentDescription = "Preview",
+                                tint = EmeraldNeon,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Text(
+                                text = "${fileTask.fileName} (${formatBytes(fileTask.fileSize)})",
+                                style = MaterialTheme.typography.bodyMedium,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
                         TextButton(onClick = { onInstantUploadSingleFile(fileTask) }) {
                             Text("Upload Immediately", color = EmeraldNeon)
                         }
@@ -1126,6 +1307,7 @@ private fun NetworkAndVaultScreen(
     val localLanIp by viewModel.localLanIp.collectAsState()
     val tailscaleIp by viewModel.tailscaleIp.collectAsState()
     val currentSsid by viewModel.currentSsid.collectAsState()
+    val isOnWifi by viewModel.isOnWifi.collectAsState()
     val trustedSsids by viewModel.trustedSsids.collectAsState()
     val restrictWifi by viewModel.restrictToTrustedWifi.collectAsState()
 
@@ -1374,8 +1556,13 @@ private fun NetworkAndVaultScreen(
                                 text = "Trusted Wi-Fi SSID Whitelisting",
                                 style = MaterialTheme.typography.titleMedium
                             )
+                            val ssidStatus = when {
+                                !currentSsid.isNullOrBlank() -> "Current SSID: $currentSsid"
+                                isOnWifi -> "Connected to Wi-Fi (Enable GPS Location to read SSID name)"
+                                else -> "Network: Mobile Data / Disconnected"
+                            }
                             Text(
-                                text = "Current SSID: ${currentSsid ?: "Mobile Data / Unknown"}",
+                                text = ssidStatus,
                                 style = MaterialTheme.typography.labelSmall,
                                 color = EmeraldNeon
                             )
@@ -1407,27 +1594,322 @@ private fun NetworkAndVaultScreen(
                                     newSsidInput = ""
                                 } else if (!currentSsid.isNullOrBlank()) {
                                     viewModel.addTrustedSsid(currentSsid!!)
+                                } else if (isOnWifi) {
+                                    viewModel.addTrustedSsid("Wi-Fi")
                                 }
                             }
                         ) {
-                            Text("Add SSID")
+                            Text("Add")
                         }
                     }
 
                     if (trustedSsids.isNotEmpty()) {
                         Spacer(modifier = Modifier.height(8.dp))
-                        Row(
+                        @OptIn(ExperimentalLayoutApi::class)
+                        FlowRow(
                             modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
                         ) {
                             trustedSsids.forEach { ssid ->
                                 AssistChip(
                                     onClick = { viewModel.removeTrustedSsid(ssid) },
-                                    label = { Text("$ssid ✕") }
+                                    label = { Text("$ssid ✕", maxLines = 1) }
                                 )
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun UploadQueueScreen(
+    viewModel: MainViewModel,
+    onPreviewMedia: (PreviewMediaData) -> Unit
+) {
+    val queue by viewModel.uploadQueue.collectAsState()
+    val telemetry by viewModel.telemetry.collectAsState()
+
+    LazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        // Header card
+        item {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(SyncProGradients.EmeraldIndigoHero)
+                    .border(1.dp, EmeraldNeon.copy(alpha = 0.35f), RoundedCornerShape(20.dp))
+                    .padding(18.dp)
+            ) {
+                Column {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column {
+                            Text(
+                                text = "Upload Queue",
+                                style = MaterialTheme.typography.titleLarge,
+                                color = Color.White
+                            )
+                            Text(
+                                text = "${queue.size} item${if (queue.size == 1) "" else "s"} pending relay",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = EmeraldNeon
+                            )
+                        }
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier
+                                .size(52.dp)
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(Color.White.copy(alpha = 0.1f))
+                        ) {
+                            Text(
+                                text = "${queue.size}",
+                                style = MaterialTheme.typography.titleLarge,
+                                color = Color.White,
+                                fontWeight = FontWeight.ExtraBold
+                            )
+                        }
+                    }
+                    if (telemetry.isRunning && !telemetry.isPaused) {
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Text(
+                            text = "▶  ${telemetry.statusBanner}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = EmeraldNeon
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        LinearProgressIndicator(
+                            progress = { telemetry.activeFileProgress.coerceIn(0f, 1f) },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(4.dp)),
+                            color = EmeraldNeon,
+                            trackColor = Color.White.copy(alpha = 0.15f)
+                        )
+                    }
+                }
+            }
+        }
+
+        // Empty state
+        if (queue.isEmpty()) {
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(18.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(32.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.CheckCircle,
+                            contentDescription = null,
+                            tint = EmeraldNeon,
+                            modifier = Modifier.size(48.dp)
+                        )
+                        Text(
+                            text = "Queue is Empty",
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                        Text(
+                            text = "All files have been relayed. Go to Folders tab to trigger new uploads, or tap Sync Now on Dashboard.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                        )
+                    }
+                }
+            }
+        } else {
+            // Legend row
+            item {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 4.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        "File (tap to preview)",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        "Priority / Actions",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
+            // Queue items
+            items(queue, key = { it.filePath }) { task ->
+                QueueItemCard(
+                    task = task,
+                    onPreview = {
+                        onPreviewMedia(
+                            PreviewMediaData(
+                                title = task.fileName,
+                                filePath = task.filePath,
+                                fileSize = task.fileSize,
+                                bucketOrSource = task.bucketName,
+                                timestamp = task.lastModified
+                            )
+                        )
+                    },
+                    onRemove = { viewModel.removeFromQueue(task.filePath) },
+                    onRaisePriority = {
+                        if (task.priorityWeight < 5) {
+                            viewModel.reprioritizeInQueue(task.filePath, task.priorityWeight + 1)
+                        }
+                    },
+                    onLowerPriority = {
+                        if (task.priorityWeight > 1) {
+                            viewModel.reprioritizeInQueue(task.filePath, task.priorityWeight - 1)
+                        }
+                    }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun QueueItemCard(
+    task: RelayQueueTask,
+    onPreview: () -> Unit,
+    onRemove: () -> Unit,
+    onRaisePriority: () -> Unit,
+    onLowerPriority: () -> Unit
+) {
+    val priorityColor = when (task.priorityWeight) {
+        5 -> CrimsonAlert
+        4 -> AmberWarning
+        3 -> EmeraldNeon
+        else -> IndigoNeon
+    }
+    val isVid = task.fileName.substringAfterLast('.', "").lowercase() in
+            setOf("mp4", "mov", "mkv", "webm", "3gp")
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onPreview() },
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            // Priority badge
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .size(36.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(priorityColor.copy(alpha = 0.15f))
+                    .border(1.dp, priorityColor.copy(alpha = 0.5f), RoundedCornerShape(10.dp))
+            ) {
+                Text(
+                    text = "P${task.priorityWeight}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = priorityColor,
+                    fontWeight = FontWeight.ExtraBold
+                )
+            }
+
+            // File info
+            Column(modifier = Modifier.weight(1f)) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Icon(
+                        imageVector = if (isVid) Icons.Default.Movie else Icons.Default.Image,
+                        contentDescription = "Preview",
+                        tint = EmeraldNeon,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Text(
+                        text = task.fileName,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Text(
+                    text = "${task.bucketName} \u2022 ${formatBytes(task.fileSize)} \u2022 Tap to preview",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+
+            // Controls
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                IconButton(
+                    onClick = onRaisePriority,
+                    modifier = Modifier.size(32.dp),
+                    enabled = task.priorityWeight < 5
+                ) {
+                    Icon(
+                        Icons.Default.KeyboardArrowUp,
+                        contentDescription = "Raise Priority",
+                        modifier = Modifier.size(18.dp),
+                        tint = if (task.priorityWeight < 5) EmeraldNeon else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f)
+                    )
+                }
+                IconButton(
+                    onClick = onLowerPriority,
+                    modifier = Modifier.size(32.dp),
+                    enabled = task.priorityWeight > 1
+                ) {
+                    Icon(
+                        Icons.Default.KeyboardArrowDown,
+                        contentDescription = "Lower Priority",
+                        modifier = Modifier.size(18.dp),
+                        tint = if (task.priorityWeight > 1) AmberWarning else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f)
+                    )
+                }
+                IconButton(
+                    onClick = onRemove,
+                    modifier = Modifier.size(32.dp)
+                ) {
+                    Icon(
+                        Icons.Default.Delete,
+                        contentDescription = "Remove from Queue",
+                        modifier = Modifier.size(18.dp),
+                        tint = CrimsonAlert
+                    )
                 }
             }
         }
@@ -1520,7 +2002,7 @@ private fun WelcomeOnboardingAndAboutModal(
                         )
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
-                            text = "Author / Architect: [Developer Name Placeholder]\nVersion: 1.0.0-ENTERPRISE (Zero-Compromise Build)",
+                            text = "Author / Architect: Siva Prasad\nVersion: 1.0.0-ENTERPRISE (Zero-Compromise Build)",
                             style = MaterialTheme.typography.labelSmall,
                             color = EmeraldNeon
                         )
@@ -1535,7 +2017,7 @@ private fun WelcomeOnboardingAndAboutModal(
                 )
 
                 OutlinedButton(
-                    onClick = { openExternalUrl(context, "https://github.com/your-org/sync-pro-android") },
+                    onClick = { openExternalUrl(context, "https://github.com/sivaprasad2003/SyncPro") },
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Icon(Icons.Default.Code, contentDescription = null)
@@ -1544,22 +2026,22 @@ private fun WelcomeOnboardingAndAboutModal(
                 }
 
                 OutlinedButton(
-                    onClick = { openExternalUrl(context, "https://t.me/SyncProOfficialGroup") },
+                    onClick = { openExternalUrl(context, "https://t.me/syncproofficial") },
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Icon(Icons.Default.Hub, contentDescription = null)
                     Spacer(modifier = Modifier.width(8.dp))
-                    Text("Join Official Telegram Group")
+                    Text("Join Official Telegram Channel")
                 }
 
                 Button(
-                    onClick = { openExternalUrl(context, "https://github.com/sponsors/your-org") },
+                    onClick = { openExternalUrl(context, "https://github.com/sivaprasad2003/SyncPro") },
                     colors = ButtonDefaults.buttonColors(containerColor = EmeraldNeon),
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Icon(Icons.Default.VolunteerActivism, contentDescription = null, tint = Color.Black)
                     Spacer(modifier = Modifier.width(8.dp))
-                    Text("Support & Donate to Project", color = Color.Black, fontWeight = FontWeight.Bold)
+                    Text("Star on GitHub & Support Project", color = Color.Black, fontWeight = FontWeight.Bold)
                 }
             }
         },
@@ -1704,3 +2186,256 @@ private fun openExternalUrl(context: Context, url: String) {
         context.startActivity(intent)
     }
 }
+
+private fun calculateInSampleSize(options: BitmapFactory.Options, reqWidth: Int, reqHeight: Int): Int {
+    val height = options.outHeight
+    val width = options.outWidth
+    var inSampleSize = 1
+    if (height > reqHeight || width > reqWidth) {
+        val halfHeight = height / 2
+        val halfWidth = width / 2
+        while (halfHeight / inSampleSize >= reqHeight && halfWidth / inSampleSize >= reqWidth) {
+            inSampleSize *= 2
+        }
+    }
+    return inSampleSize.coerceAtLeast(1)
+}
+
+@Composable
+private fun MediaPreviewDialog(
+    media: PreviewMediaData,
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+    var previewBitmap by remember(media) { mutableStateOf<Bitmap?>(null) }
+    var isLoading by remember(media) { mutableStateOf(true) }
+
+    val isVideo = media.title.substringAfterLast('.', "").lowercase() in
+            setOf("mp4", "mov", "mkv", "webm", "3gp", "avi")
+
+    LaunchedEffect(media) {
+        isLoading = true
+        withContext(Dispatchers.IO) {
+            val bmp = runCatching {
+                if (!media.contentUri.isNullOrBlank()) {
+                    val uri = Uri.parse(media.contentUri)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        try {
+                            context.contentResolver.loadThumbnail(uri, Size(800, 800), null)
+                        } catch (_: Exception) {
+                            context.contentResolver.openInputStream(uri)?.use { stream ->
+                                val options = BitmapFactory.Options().apply {
+                                    inJustDecodeBounds = true
+                                }
+                                BitmapFactory.decodeStream(stream, null, options)
+                                options.inSampleSize = calculateInSampleSize(options, 800, 800)
+                                options.inJustDecodeBounds = false
+                                context.contentResolver.openInputStream(uri)?.use { secondStream ->
+                                    BitmapFactory.decodeStream(secondStream, null, options)
+                                }
+                            }
+                        }
+                    } else {
+                        context.contentResolver.openInputStream(uri)?.use { stream ->
+                            val options = BitmapFactory.Options().apply { inSampleSize = 2 }
+                            BitmapFactory.decodeStream(stream, null, options)
+                        }
+                    }
+                } else if (!media.filePath.isNullOrBlank()) {
+                    val file = File(media.filePath)
+                    if (file.exists() && file.canRead()) {
+                        if (isVideo) {
+                            @Suppress("DEPRECATION")
+                            ThumbnailUtils.createVideoThumbnail(media.filePath, MediaStore.Images.Thumbnails.MINI_KIND)
+                        } else {
+                            val options = BitmapFactory.Options().apply {
+                                inJustDecodeBounds = true
+                            }
+                            BitmapFactory.decodeFile(media.filePath, options)
+                            options.inSampleSize = calculateInSampleSize(options, 800, 800)
+                            options.inJustDecodeBounds = false
+                            BitmapFactory.decodeFile(media.filePath, options)
+                        }
+                    } else null
+                } else null
+            }.getOrNull()
+            previewBitmap = bmp
+            isLoading = false
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(
+                    imageVector = if (isVideo) Icons.Default.Movie else Icons.Default.Image,
+                    contentDescription = null,
+                    tint = EmeraldNeon
+                )
+                Text(
+                    text = media.title,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    style = MaterialTheme.typography.titleMedium
+                )
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(240.dp)
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(Color.Black.copy(alpha = 0.4f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    when {
+                        isLoading -> {
+                            CircularProgressIndicator(color = EmeraldNeon)
+                        }
+                        previewBitmap != null -> {
+                            Image(
+                                bitmap = previewBitmap!!.asImageBitmap(),
+                                contentDescription = media.title,
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .clip(RoundedCornerShape(16.dp)),
+                                contentScale = androidx.compose.ui.layout.ContentScale.Fit
+                            )
+                            if (isVideo) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(48.dp)
+                                        .background(Color.Black.copy(alpha = 0.6f), CircleShape),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(
+                                        Icons.Default.PlayArrow,
+                                        contentDescription = "Play Video",
+                                        tint = Color.White,
+                                        modifier = Modifier.size(32.dp)
+                                    )
+                                }
+                            }
+                        }
+                        else -> {
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Icon(
+                                    imageVector = if (isVideo) Icons.Default.Movie else Icons.Default.Image,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(56.dp),
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)
+                                )
+                                Text(
+                                    text = if (isVideo) "Video File Preview" else "Preview Unavailable",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(14.dp))
+
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text(
+                            text = "Size: ${formatBytes(media.fileSize)}",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.Medium
+                        )
+                        if (media.bucketOrSource.isNotBlank()) {
+                            Text(
+                                text = "Folder / Node: ${media.bucketOrSource}",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                        if (media.timestamp > 0) {
+                            val formattedDate = remember(media.timestamp) {
+                                SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date(media.timestamp))
+                            }
+                            Text(
+                                text = "Timestamp: $formattedDate",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                        if (!media.sha256.isNullOrBlank()) {
+                            Text(
+                                text = "SHA-256: ${media.sha256}",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontFamily = FontFamily.Monospace,
+                                color = EmeraldNeon
+                            )
+                        }
+                        if (!media.filePath.isNullOrBlank()) {
+                            Text(
+                                text = "Path: ${media.filePath}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    runCatching {
+                        val viewIntent = Intent(Intent.ACTION_VIEW).apply {
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            val mime = if (isVideo) "video/*" else "image/*"
+                            if (!media.contentUri.isNullOrBlank()) {
+                                setDataAndType(Uri.parse(media.contentUri), mime)
+                            } else if (!media.filePath.isNullOrBlank()) {
+                                val file = File(media.filePath)
+                                val fileUri = FileProvider.getUriForFile(
+                                    context,
+                                    "${context.packageName}.fileprovider",
+                                    file
+                                )
+                                setDataAndType(fileUri, mime)
+                            }
+                        }
+                        context.startActivity(Intent.createChooser(viewIntent, "Open media with"))
+                    }.onFailure {
+                        Toast.makeText(context, "Could not open viewer: ${it.localizedMessage}", Toast.LENGTH_SHORT).show()
+                    }
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = EmeraldNeon)
+            ) {
+                Icon(Icons.Default.OpenInNew, contentDescription = null, tint = Color.Black, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Open In Viewer", color = Color.Black, fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Close")
+            }
+        }
+    )
+}

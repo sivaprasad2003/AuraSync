@@ -278,9 +278,7 @@ class HubForegroundService : Service() {
             action = SyncNotificationReceiver.ACTION_SYNC_NOW
         }
         val syncNowPending = PendingIntent.getBroadcast(
-            this,
-            101,
-            syncNowIntent,
+            this, 101, syncNowIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
@@ -288,9 +286,15 @@ class HubForegroundService : Service() {
             action = SyncNotificationReceiver.ACTION_PAUSE_RESUME
         }
         val pauseResumePending = PendingIntent.getBroadcast(
-            this,
-            102,
-            pauseResumeIntent,
+            this, 102, pauseResumeIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val stopSyncIntent = Intent(this, SyncNotificationReceiver::class.java).apply {
+            action = SyncNotificationReceiver.ACTION_STOP_SYNC
+        }
+        val stopSyncPending = PendingIntent.getBroadcast(
+            this, 103, stopSyncIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
@@ -307,6 +311,7 @@ class HubForegroundService : Service() {
             .setProgress(100, progress, isIndeterminate)
             .addAction(android.R.drawable.ic_popup_sync, "Sync Now", syncNowPending)
             .addAction(android.R.drawable.ic_media_pause, pauseActionLabel, pauseResumePending)
+            .addAction(android.R.drawable.ic_delete, "Stop", stopSyncPending)
             .build()
     }
 
@@ -384,6 +389,9 @@ class SyncNotificationReceiver : BroadcastReceiver() {
             ACTION_PAUSE_RESUME -> {
                 relayEngine.togglePause()
             }
+            ACTION_STOP_SYNC -> {
+                relayEngine.clearQueueAndStop()
+            }
             Intent.ACTION_BOOT_COMPLETED -> {
                 HubForegroundService.startOrUpdate(context)
                 SyncWorkers.scheduleDailyAutomatedSync(context)
@@ -394,5 +402,6 @@ class SyncNotificationReceiver : BroadcastReceiver() {
     companion object {
         const val ACTION_SYNC_NOW = "com.enterprise.syncpro.ACTION_SYNC_NOW"
         const val ACTION_PAUSE_RESUME = "com.enterprise.syncpro.ACTION_PAUSE_RESUME"
+        const val ACTION_STOP_SYNC = "com.enterprise.syncpro.ACTION_STOP_SYNC"
     }
 }

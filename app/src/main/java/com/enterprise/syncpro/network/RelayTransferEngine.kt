@@ -84,6 +84,10 @@ class RelayTransferEngine private constructor(private val context: Context) {
     private val _telemetry = MutableStateFlow(TransferLiveTelemetry())
     val telemetry: StateFlow<TransferLiveTelemetry> = _telemetry.asStateFlow()
 
+    // Exposed live upload queue snapshot for the UI queue viewer
+    private val _uploadQueue = MutableStateFlow<List<RelayQueueTask>>(emptyList())
+    val uploadQueue: StateFlow<List<RelayQueueTask>> = _uploadQueue.asStateFlow()
+
     var onLowStorageEmergencyCallback: (() -> Unit)? = null
 
     fun setPaused(paused: Boolean) {
@@ -113,6 +117,8 @@ class RelayTransferEngine private constructor(private val context: Context) {
                 priorityQueue.removeIf { it.filePath == effectiveTask.filePath }
                 priorityQueue.put(effectiveTask)
             }
+            val queueSnapshot = priorityQueue.toList().sortedDescending()
+            _uploadQueue.value = queueSnapshot
             _telemetry.value = _telemetry.value.copy(
                 queuedFileCount = priorityQueue.size,
                 statusBanner = if (isUrgentInstantUpload) {
@@ -122,6 +128,48 @@ class RelayTransferEngine private constructor(private val context: Context) {
                 }
             )
             ensureSenderWorkerRunning()
+        }
+    }
+
+    /** Remove a specific task from the upload queue by file path. */
+    fun removeTaskFromQueue(filePath: String) {
+        ioScope.launch {
+            priorityQueue.removeIf { it.filePath == filePath }
+            _uploadQueue.value = priorityQueue.toList().sortedDescending()
+            _telemetry.value = _telemetry.value.copy(queuedFileCount = priorityQueue.size)
+        }
+    }
+
+    /** Re-prioritize an existing task in the queue. */
+    fun reprioritizeTask(filePath: String, newPriority: Int) {
+        ioScope.launch {
+            val existing = priorityQueue.find { it.filePath == filePath } ?: return@launch
+            priorityQueue.removeIf { it.filePath == filePath }
+            priorityQueue.put(existing.copy(priorityWeight = newPriority.coerceIn(1, 5), enqueuedAt = System.nanoTime()))
+            _uploadQueue.value = priorityQueue.toList().sortedDescending()
+            _telemetry.value = _telemetry.value.copy(queuedFileCount = priorityQueue.size)
+        }
+    }
+
+    /**
+     * Completely stops ongoing sync, cancels transfer workers, and purges the priority queue.
+     */
+    fun clearQueueAndStop() {
+        ioScope.launch {
+            priorityQueue.clear()
+            _uploadQueue.value = emptyList()
+            senderConsumerJob?.cancel()
+            senderConsumerJob = null
+            _telemetry.value = _telemetry.value.copy(
+                isRunning = false,
+                isPaused = false,
+                activeFileName = "Idle",
+                activeFileProgress = 0f,
+                currentSpeedMbps = 0f,
+                queuedFileCount = 0,
+                statusBanner = "Sync Stopped & Queue Cleared"
+            )
+            logEvent("INFO", "RelayControl", "Sync manually stopped; upload queue cleared.")
         }
     }
 
@@ -254,7 +302,7 @@ class RelayTransferEngine private constructor(private val context: Context) {
                             activeFileName = originalName,
                             activeFileProgress = (totalReceived.toFloat() / fileSize.coerceAtLeast(1L)).coerceIn(0f, 1f),
                             currentSpeedMbps = mbps,
-                            statusBanner = "Receiving $originalName from$sourceDevice"
+                            statusBanner = "Receiving $originalName from $sourceDevice"
                         )
                     }
                     fos.fd.sync()
@@ -419,12 +467,14 @@ class RelayTransferEngine private constructor(private val context: Context) {
                 }
 
                 val task = priorityQueue.poll() ?: break
+                _uploadQueue.value = priorityQueue.toList().sortedDescending()
                 _telemetry.value = _telemetry.value.copy(queuedFileCount = priorityQueue.size)
 
                 val outcome = executePrimaryFileRelay(task, token)
                 if (!outcome) {
                     // Re-queue on transient network handover and wait briefly
                     priorityQueue.put(task)
+                    _uploadQueue.value = priorityQueue.toList().sortedDescending()
                     delay(3_000)
                 }
             }
