@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.SyncPro" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="android:statusBarColor">#080B11</item>
+        <item name="android:navigationBarColor">#111726</item>
+    </style>
+</resources>
