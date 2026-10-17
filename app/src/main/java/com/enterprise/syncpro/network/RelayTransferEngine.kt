@@ -13,6 +13,8 @@ import com.enterprise.syncpro.data.LocalFileIndexEntity
 import com.enterprise.syncpro.data.PairingToken
 import com.enterprise.syncpro.data.SyncDatabase
 import com.enterprise.syncpro.data.VaultManager
+import com.enterprise.syncpro.media.MediaAndQrEngine
+import com.enterprise.syncpro.service.HubForegroundService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -21,6 +23,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -90,6 +93,18 @@ class RelayTransferEngine private constructor(private val context: Context) {
 
     var onLowStorageEmergencyCallback: (() -> Unit)? = null
 
+    init {
+        ioScope.launch {
+            vault.deviceRole.collectLatest { role ->
+                if (role == com.enterprise.syncpro.data.DeviceRole.SECONDARY_HUB) {
+                    startSecondaryHubServer(NetworkAndSafetyMonitor.DEFAULT_HUB_PORT)
+                } else {
+                    stopSecondaryHubServer()
+                }
+            }
+        }
+    }
+
     fun setPaused(paused: Boolean) {
         _telemetry.value = _telemetry.value.copy(
             isPaused = paused,
@@ -128,6 +143,7 @@ class RelayTransferEngine private constructor(private val context: Context) {
                 }
             )
             ensureSenderWorkerRunning()
+            HubForegroundService.startOrUpdate(context)
         }
     }
 
@@ -137,6 +153,18 @@ class RelayTransferEngine private constructor(private val context: Context) {
             priorityQueue.removeIf { it.filePath == filePath }
             _uploadQueue.value = priorityQueue.toList().sortedDescending()
             _telemetry.value = _telemetry.value.copy(queuedFileCount = priorityQueue.size)
+        }
+    }
+
+    /** Remove all tasks belonging to an unselected bucket/folder from the upload queue. */
+    fun removeTasksForBucket(bucketName: String) {
+        ioScope.launch {
+            val removedCount = priorityQueue.count { it.bucketName.equals(bucketName, ignoreCase = true) }
+            if (removedCount > 0) {
+                priorityQueue.removeIf { it.bucketName.equals(bucketName, ignoreCase = true) }
+                _uploadQueue.value = priorityQueue.toList().sortedDescending()
+                _telemetry.value = _telemetry.value.copy(queuedFileCount = priorityQueue.size)
+            }
         }
     }
 
@@ -170,6 +198,7 @@ class RelayTransferEngine private constructor(private val context: Context) {
                 statusBanner = "Sync Stopped & Queue Cleared"
             )
             logEvent("INFO", "RelayControl", "Sync manually stopped; upload queue cleared.")
+            HubForegroundService.startOrUpdate(context, HubForegroundService.ACTION_STOP_SERVICE)
         }
     }
 
@@ -177,11 +206,14 @@ class RelayTransferEngine private constructor(private val context: Context) {
      * Starts the 24/7 Secondary Hub TCP Server on Dispatchers.IO.
      */
     fun startSecondaryHubServer(port: Int = NetworkAndSafetyMonitor.DEFAULT_HUB_PORT) {
-        if (serverJob?.isActive == true) return
+        if (serverJob?.isActive == true && serverSocket?.isBound == true && serverSocket?.isClosed == false) return
+        stopSecondaryHubServer()
         serverJob = ioScope.launch {
             runCatching {
                 val deviceId = vault.getOrCreateDeviceId()
-                networkMonitor.startMdnsHubBroadcast(port, deviceId)
+                val secretHex = vault.getOrCreateHubSecretHex()
+                val pinHash = vault.getPinHashOrDefault()
+                networkMonitor.startMdnsHubBroadcast(port, deviceId, secretHex, pinHash)
                 serverSocket = ServerSocket().apply {
                     reuseAddress = true
                     bind(InetSocketAddress("0.0.0.0", port))
@@ -201,6 +233,10 @@ class RelayTransferEngine private constructor(private val context: Context) {
                 }
             }.onFailure { err ->
                 logEvent("ERROR", "HubServer", "Server loop terminated: ${err.message}")
+                _telemetry.value = _telemetry.value.copy(
+                    isRunning = false,
+                    statusBanner = "Hub Server Error: ${err.message}"
+                )
             }
         }
     }
@@ -260,15 +296,95 @@ class RelayTransferEngine private constructor(private val context: Context) {
                 return@withContext
             }
 
+            dao.upsertConnectedDevice(
+                com.enterprise.syncpro.data.ConnectedDeviceEntity(
+                    deviceId = sourceDevice,
+                    deviceName = "Primary Node ($sourceDevice)",
+                    ipAddress = client.inetAddress?.hostAddress ?: "Wi-Fi LAN",
+                    role = "PRIMARY_SENDER",
+                    scheduledSync = "Every 12h",
+                    bandwidthLimitKbps = 0,
+                    syncStatus = "Receiving $originalName",
+                    trafficBytes = fileSize,
+                    lastSeen = System.currentTimeMillis()
+                )
+            )
+
             // Tier-2 Remote Pre-Flight Deduplication Check under Mutex
-            val alreadyExists = hubHandshakeMutex.withLock {
+            var alreadyExistsOnHub = hubHandshakeMutex.withLock {
                 dao.isHashPresentOnHub(sha256)
             }
-            if (alreadyExists) {
+
+            // 1. Check if hash is already indexed in local file index
+            if (!alreadyExistsOnHub) {
+                val localEntity = dao.findLocalFileByHash(sha256)
+                if (localEntity != null) {
+                    hubHandshakeMutex.withLock {
+                        dao.registerHubReceivedFile(
+                            HubDeduplicationEntity(
+                                sha256 = sha256,
+                                savedUri = localEntity.filePath,
+                                finalFileName = localEntity.fileName,
+                                fileSize = localEntity.fileSize,
+                                sourceDevice = sourceDevice,
+                                receivedAt = System.currentTimeMillis()
+                            )
+                        )
+                    }
+                    alreadyExistsOnHub = true
+                }
+            }
+
+            // 2. Check if the exact photo/video already exists in Secondary Phone's MediaStore
+            if (!alreadyExistsOnHub) {
+                val existingMatch = MediaAndQrEngine.findExistingMediaMatch(
+                    context = context,
+                    targetSha256 = sha256,
+                    targetFileName = originalName,
+                    targetFileSize = fileSize
+                )
+                if (existingMatch != null) {
+                    // Photo ALREADY EXISTS on this phone!
+                    // DO NOT copy to DCIM/Camera, DO NOT duplicate!
+                    // Apply token/keys to deduplication registry and acknowledge
+                    hubHandshakeMutex.withLock {
+                        dao.registerHubReceivedFile(
+                            HubDeduplicationEntity(
+                                sha256 = sha256,
+                                savedUri = existingMatch.contentUri,
+                                finalFileName = existingMatch.fileName,
+                                fileSize = existingMatch.fileSize,
+                                sourceDevice = sourceDevice,
+                                receivedAt = System.currentTimeMillis()
+                            )
+                        )
+                    }
+                    dao.upsertLocalFileIndex(
+                        LocalFileIndexEntity(
+                            filePath = existingMatch.filePath,
+                            fileName = existingMatch.fileName,
+                            bucketName = existingMatch.bucketName,
+                            fileSize = existingMatch.fileSize,
+                            lastModified = existingMatch.lastModified,
+                            sha256 = sha256,
+                            isSynced = true,
+                            syncedTimestamp = System.currentTimeMillis()
+                        )
+                    )
+                    alreadyExistsOnHub = true
+                    logEvent(
+                        "INFO",
+                        "Deduplication",
+                        "Matched existing media on Secondary phone: ${existingMatch.filePath}. Kept in place without duplicate copy."
+                    )
+                }
+            }
+
+            if (alreadyExistsOnHub) {
                 writer.println("SKIP_DUPLICATE")
                 _telemetry.value = _telemetry.value.copy(
                     skippedDuplicateFiles = _telemetry.value.skippedDuplicateFiles + 1,
-                    statusBanner = "Deduplicated: $originalName already in Hub Vault"
+                    statusBanner = "Deduplicated: $originalName already existed on Secondary Hub"
                 )
                 return@withContext
             }
@@ -427,11 +543,14 @@ class RelayTransferEngine private constructor(private val context: Context) {
 
             while (isActive && priorityQueue.isNotEmpty()) {
                 // Respect user pause & hardware safety switches
-                val safety = networkMonitor.evaluateHardwareSafetyGuards()
+                val safety = networkMonitor.evaluateHardwareSafetyGuards(
+                    tempCutoff = vault.tempCutoffCelsius.value,
+                    batteryCutoff = vault.batteryCutoffPercent.value
+                )
                 if (!safety.isSafeToSync) {
                     val reason = when {
-                        safety.isThermalTripped -> "Paused: Battery Temp ${safety.temperatureCelsius}°C exceeds 45°C"
-                        safety.isLowBatteryTripped -> "Paused: Battery ${safety.batteryPercent}% unplugged (< 15%)"
+                        safety.isThermalTripped -> "Paused: Battery Temp ${String.format("%.1f", safety.temperatureCelsius)}°C exceeds cutoff (${vault.tempCutoffCelsius.value}°C)"
+                        safety.isLowBatteryTripped -> "Paused: Battery ${safety.batteryPercent}% unplugged (< ${vault.batteryCutoffPercent.value}%)"
                         else -> "Paused: Storage below 1GB safety threshold"
                     }
                     _telemetry.value = _telemetry.value.copy(isPaused = true, statusBanner = reason)
@@ -527,8 +646,19 @@ class RelayTransferEngine private constructor(private val context: Context) {
             if (token.tailscaleOrWanHost.isNotBlank()) add(token.tailscaleOrWanHost to token.port)
         }.distinct()
 
+        if (candidateHosts.isEmpty()) {
+            _telemetry.value = _telemetry.value.copy(
+                statusBanner = "No Hub IP found. Scan Hub QR Code or connect in Network tab."
+            )
+            return@withContext false
+        }
+
+        var lastErrorMsg = "Connection failed"
         for ((host, port) in candidateHosts) {
             val handedOverEpochBefore = networkMonitor.networkHandoverEpoch.value
+            _telemetry.value = _telemetry.value.copy(
+                statusBanner = "Connecting to Hub at $host:$port..."
+            )
             val result = runCatching {
                 Socket().use { socket ->
                     socket.connect(InetSocketAddress(host, port), 6_000)
@@ -575,11 +705,17 @@ class RelayTransferEngine private constructor(private val context: Context) {
                         "REJECT_LOW_STORAGE" -> {
                             setPaused(true)
                             onLowStorageEmergencyCallback?.invoke()
+                            _telemetry.value = _telemetry.value.copy(
+                                statusBanner = "Hub Paused: Secondary Hub has < 1GB free storage."
+                            )
                             logEvent("ERROR", "HubStorage", "Hub storage < 1GB! Transfer paused.")
                             return@use false
                         }
                         "REJECT_AUTH" -> {
                             setPaused(true)
+                            _telemetry.value = _telemetry.value.copy(
+                                statusBanner = "Auth Failed: Please re-scan Hub QR Code or Re-connect."
+                            )
                             logEvent("SECURITY", "Handshake", "Hub rejected pairing token/PIN.")
                             return@use false
                         }
@@ -633,10 +769,18 @@ class RelayTransferEngine private constructor(private val context: Context) {
                         else -> false
                     }
                 }
+            }.onFailure { err ->
+                lastErrorMsg = err.localizedMessage ?: err.javaClass.simpleName
+                logEvent("WARN", "RelayTransfer", "Failed to connect to Hub at $host:$port: $lastErrorMsg")
             }.getOrDefault(false)
 
             if (result) return@withContext true
         }
+
+        _telemetry.value = _telemetry.value.copy(
+            activeEndpointRoute = "Unreachable",
+            statusBanner = "Cannot reach Hub at ${candidateHosts.map { "${it.first}:${it.second}" }.joinToString()} ($lastErrorMsg). Retrying..."
+        )
         false
     }
 

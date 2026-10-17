@@ -21,6 +21,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.net.Inet4Address
@@ -30,7 +32,9 @@ data class DiscoveredHubEndpoint(
     val serviceName: String,
     val hostAddress: String,
     val port: Int,
-    val isMeshOrWan: Boolean = false
+    val isMeshOrWan: Boolean = false,
+    val secretHex: String = "",
+    val pinHash: String = ""
 )
 
 data class HardwareSafetyStatus(
@@ -84,8 +88,11 @@ class NetworkAndSafetyMonitor private constructor(private val context: Context) 
     init {
         registerNetworkCallback()
         scope.launch {
-            refreshNetworkInterfaces()
-            evaluateHardwareSafetyGuards()
+            while (isActive) {
+                refreshNetworkInterfaces()
+                evaluateHardwareSafetyGuards()
+                delay(2_500)
+            }
         }
     }
 
@@ -137,26 +144,39 @@ class NetworkAndSafetyMonitor private constructor(private val context: Context) 
      */
     suspend fun refreshNetworkInterfaces() = withContext(Dispatchers.IO) {
         runCatching {
-            var foundLan = "0.0.0.0"
+            var foundWlan: String? = null
+            var foundPrivateLan: String? = null
+            var foundLanFallback: String? = null
             var foundTailscale: String? = null
 
             val interfaces = NetworkInterface.getNetworkInterfaces()?.toList().orEmpty()
             for (nif in interfaces) {
                 if (!nif.isUp || nif.isLoopback) continue
                 val name = nif.name.lowercase()
+                val isWlan = name.startsWith("wlan") || name.startsWith("ap") || name.startsWith("softap") ||
+                        name.startsWith("swlan") || name.startsWith("wigig") || name.startsWith("eth")
+                val isCellular = name.startsWith("rmnet") || name.startsWith("pdp") || name.startsWith("ccmni")
                 for (addr in nif.inetAddresses) {
                     if (addr is Inet4Address && !addr.isLoopbackAddress) {
                         val ip = addr.hostAddress ?: continue
                         val firstOctet = ip.substringBefore('.').toIntOrNull() ?: 0
-                        if (firstOctet == 100 || name.contains("tailscale") || name.contains("zt") || name.contains("tun")) {
+                        val isTailscale = firstOctet == 100 || name.contains("tailscale") || name.contains("zt") || name.contains("tun")
+                        if (isTailscale) {
                             foundTailscale = ip
-                        } else if (foundLan == "0.0.0.0") {
-                            foundLan = ip
+                        } else if (isWlan) {
+                            if (foundWlan == null) foundWlan = ip
+                        } else if (!isCellular) {
+                            if (addr.isSiteLocalAddress && foundPrivateLan == null) {
+                                foundPrivateLan = ip
+                            } else if (foundLanFallback == null) {
+                                foundLanFallback = ip
+                            }
                         }
                     }
                 }
             }
-            _localLanIp.value = foundLan
+            val bestLan = foundWlan ?: foundPrivateLan ?: foundLanFallback ?: "0.0.0.0"
+            _localLanIp.value = bestLan
             _tailscaleIp.value = foundTailscale
 
             // Active network capabilities check
@@ -191,9 +211,12 @@ class NetworkAndSafetyMonitor private constructor(private val context: Context) 
     }
 
     /**
-     * Evaluates Thermal (> 45.0 C), Battery (< 15% unplugged), and Storage (< 1GB free) safety guards.
+     * Evaluates Thermal, Battery, and Storage (< 1GB free) safety guards.
      */
-    suspend fun evaluateHardwareSafetyGuards(): HardwareSafetyStatus = withContext(Dispatchers.IO) {
+    suspend fun evaluateHardwareSafetyGuards(
+        tempCutoff: Float = 45.0f,
+        batteryCutoff: Int = 15
+    ): HardwareSafetyStatus = withContext(Dispatchers.IO) {
         val batteryIntent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
         val level = batteryIntent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: 100
         val scale = batteryIntent?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: 100
@@ -211,8 +234,8 @@ class NetworkAndSafetyMonitor private constructor(private val context: Context) 
         val statFs = StatFs(Environment.getExternalStorageDirectory().absolutePath)
         val availableBytes = statFs.availableBytes
 
-        val thermalTripped = tempCelsius > 45.0f
-        val lowBatteryTripped = !isCharging && batteryPct < 15
+        val thermalTripped = tempCelsius > tempCutoff
+        val lowBatteryTripped = !isCharging && batteryPct < batteryCutoff
         val lowStorageTripped = availableBytes < ONE_GIGABYTE_BYTES
 
         val result = HardwareSafetyStatus(
@@ -242,9 +265,9 @@ class NetworkAndSafetyMonitor private constructor(private val context: Context) 
     }
 
     /**
-     * Registers `_syncvault._tcp.` mDNS service on the Secondary Hub.
+     * Registers `_syncvault._tcp.` mDNS service on the Secondary Hub with pairing credentials.
      */
-    fun startMdnsHubBroadcast(port: Int, hubDeviceId: String) {
+    fun startMdnsHubBroadcast(port: Int, hubDeviceId: String, secretHex: String = "", pinHash: String = "") {
         stopMdnsHubBroadcast()
         runCatching {
             multicastLock = wifiManager.createMulticastLock("SyncProMdnsLock").apply {
@@ -255,6 +278,13 @@ class NetworkAndSafetyMonitor private constructor(private val context: Context) 
                 serviceName = "SyncProHub_${hubDeviceId.take(6)}"
                 serviceType = MDNS_SERVICE_TYPE
                 setPort(port)
+                if (secretHex.isNotBlank()) {
+                    setAttribute("secret", secretHex)
+                }
+                if (pinHash.isNotBlank()) {
+                    setAttribute("pinHash", pinHash)
+                }
+                setAttribute("hubId", hubDeviceId)
             }
             registrationListener = object : NsdManager.RegistrationListener {
                 override fun onServiceRegistered(info: NsdServiceInfo) {}
@@ -315,11 +345,19 @@ class NetworkAndSafetyMonitor private constructor(private val context: Context) 
                 override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {}
                 override fun onServiceResolved(resolvedInfo: NsdServiceInfo) {
                     val hostIp = resolvedInfo.host?.hostAddress ?: return
+                    val secret = resolvedInfo.attributes?.get("secret")?.let {
+                        runCatching { String(it, Charsets.UTF_8) }.getOrDefault("")
+                    } ?: ""
+                    val pinHash = resolvedInfo.attributes?.get("pinHash")?.let {
+                        runCatching { String(it, Charsets.UTF_8) }.getOrDefault("")
+                    } ?: ""
                     val endpoint = DiscoveredHubEndpoint(
                         serviceName = resolvedInfo.serviceName,
                         hostAddress = hostIp,
                         port = resolvedInfo.port,
-                        isMeshOrWan = hostIp.startsWith("100.")
+                        isMeshOrWan = hostIp.startsWith("100."),
+                        secretHex = secret,
+                        pinHash = pinHash
                     )
                     val updated = (_discoveredHubs.value + endpoint)
                         .distinctBy { "${it.hostAddress}:${it.port}" }

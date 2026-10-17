@@ -56,6 +56,19 @@ data class DiagnosticLogEntity(
     @ColumnInfo(name = "message") val message: String
 )
 
+@Entity(tableName = "connected_devices")
+data class ConnectedDeviceEntity(
+    @PrimaryKey val deviceId: String,
+    @ColumnInfo(name = "device_name") val deviceName: String,
+    @ColumnInfo(name = "ip_address") val ipAddress: String,
+    @ColumnInfo(name = "role") val role: String,
+    @ColumnInfo(name = "scheduled_sync") val scheduledSync: String = "12:00 AM",
+    @ColumnInfo(name = "bandwidth_limit_kbps") val bandwidthLimitKbps: Int = 0,
+    @ColumnInfo(name = "sync_status") val syncStatus: String = "Idle",
+    @ColumnInfo(name = "traffic_bytes") val trafficBytes: Long = 0L,
+    @ColumnInfo(name = "last_seen") val lastSeen: Long = System.currentTimeMillis()
+)
+
 @Dao
 interface SyncDao {
     // Tier 1 Fast-Path Local Index lookup
@@ -84,6 +97,15 @@ interface SyncDao {
     @Query("SELECT COALESCE(SUM(file_size), 0) FROM local_file_index WHERE is_synced = 1")
     fun observeTotalSyncedBytes(): Flow<Long>
 
+    @Query("SELECT * FROM local_file_index WHERE is_synced = 1 ORDER BY synced_timestamp DESC LIMIT 50")
+    fun observeRecentUploadedFiles(): Flow<List<LocalFileIndexEntity>>
+
+    @Query("SELECT * FROM local_file_index WHERE sha256 = :sha256 LIMIT 1")
+    suspend fun findLocalFileByHash(sha256: String): LocalFileIndexEntity?
+
+    @Query("SELECT EXISTS(SELECT 1 FROM local_file_index WHERE sha256 = :sha256)")
+    suspend fun isHashPresentLocally(sha256: String): Boolean
+
     // Tier 2 Remote Pre-Flight Handshake lookup on Secondary Hub
     @Query("SELECT EXISTS(SELECT 1 FROM hub_deduplication_registry WHERE sha256 = :sha256)")
     suspend fun isHashPresentOnHub(sha256: String): Boolean
@@ -100,6 +122,22 @@ interface SyncDao {
     @Query("SELECT * FROM hub_deduplication_registry ORDER BY received_at DESC LIMIT 50")
     fun observeRecentHubFiles(): Flow<List<HubDeduplicationEntity>>
 
+    // Multi-Device Peer Mesh Tracking
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertConnectedDevice(device: ConnectedDeviceEntity)
+
+    @Query("SELECT * FROM connected_devices ORDER BY last_seen DESC")
+    fun observeConnectedDevices(): Flow<List<ConnectedDeviceEntity>>
+
+    @Query("UPDATE connected_devices SET bandwidth_limit_kbps = :bandwidthLimitKbps WHERE deviceId = :deviceId")
+    suspend fun updateDeviceBandwidth(deviceId: String, bandwidthLimitKbps: Int)
+
+    @Query("UPDATE connected_devices SET traffic_bytes = traffic_bytes + :bytesAdded, last_seen = :now, sync_status = :status WHERE deviceId = :deviceId")
+    suspend fun recordDeviceTraffic(deviceId: String, bytesAdded: Long, status: String, now: Long = System.currentTimeMillis())
+
+    @Query("DELETE FROM connected_devices WHERE deviceId = :deviceId")
+    suspend fun removeConnectedDevice(deviceId: String)
+
     // Diagnostic Logging
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertLog(log: DiagnosticLogEntity)
@@ -115,9 +153,10 @@ interface SyncDao {
     entities = [
         LocalFileIndexEntity::class,
         HubDeduplicationEntity::class,
-        DiagnosticLogEntity::class
+        DiagnosticLogEntity::class,
+        ConnectedDeviceEntity::class
     ],
-    version = 1,
+    version = 2,
     exportSchema = false
 )
 abstract class SyncDatabase : RoomDatabase() {

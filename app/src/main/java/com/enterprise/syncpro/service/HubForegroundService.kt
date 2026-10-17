@@ -65,24 +65,7 @@ class HubForegroundService : Service() {
             postLowStorageEmergencyNotification()
         }
 
-        val initialNotification = buildTelemetryNotification(
-            title = "Sync Pro 24/7 Engine Active",
-            statusText = "Initializing P2P Relay & mDNS Discovery...",
-            progress = 0,
-            isIndeterminate = true,
-            isPaused = false
-        )
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID_FOREGROUND,
-                initialNotification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-            )
-        } else {
-            startForeground(NOTIFICATION_ID_FOREGROUND, initialNotification)
-        }
+        ensureForegroundNotification()
 
         observeRoleAndTelemetry()
         startHardwareSafetyWatchdog()
@@ -91,10 +74,18 @@ class HubForegroundService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP_SERVICE -> {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                } else {
+                    @Suppress("DEPRECATION")
+                    stopForeground(true)
+                }
+                notificationManager.cancel(NOTIFICATION_ID_FOREGROUND)
                 stopSelf()
                 return START_NOT_STICKY
             }
             ACTION_TRIGGER_IMMEDIATE_SCAN -> {
+                ensureForegroundNotification()
                 serviceScope.launch {
                     val buckets = vault.enabledBuckets.value
                     val weight = vault.devicePriorityWeight.value
@@ -106,8 +97,49 @@ class HubForegroundService : Service() {
                     relayEngine.enqueueTasks(tasks, isUrgentInstantUpload = false)
                 }
             }
+            else -> {
+                ensureForegroundNotification()
+            }
         }
         return START_STICKY
+    }
+
+    private fun ensureForegroundNotification() {
+        val state = relayEngine.telemetry.value
+        val isHub = vault.deviceRole.value == DeviceRole.SECONDARY_HUB
+        val isSyncActive = state.isRunning || state.queuedFileCount > 0
+        val isSyncPaused = state.isPaused && (state.queuedFileCount > 0 || state.isRunning)
+        val isSyncCompleted = state.completedSessionFiles > 0 && state.queuedFileCount == 0 && !state.isRunning
+
+        val roleLabel = if (isHub) "Secondary Hub (Receiver)" else "Primary Node (Sender)"
+        val progressPercent = (state.activeFileProgress * 100f).roundToInt().coerceIn(0, 100)
+        val speedFormatted = String.format("%.2f MB/s", state.currentSpeedMbps)
+        val bodyText = when {
+            isSyncCompleted -> "Sync Completed • ${state.completedSessionFiles} files transferred"
+            isSyncPaused -> "Sync Paused • Queue: ${state.queuedFileCount}"
+            state.isRunning && state.activeFileName != "Idle" -> "${state.activeFileName} • $speedFormatted • Queue: ${state.queuedFileCount}"
+            isHub -> "Hub Ready • Listening on TCP :${NetworkAndSafetyMonitor.DEFAULT_HUB_PORT}"
+            else -> "AuraSync Engine Standby"
+        }
+
+        val notification = buildTelemetryNotification(
+            title = if (isSyncCompleted) "AuraSync • Completed" else "AuraSync • $roleLabel",
+            statusText = bodyText,
+            progress = progressPercent,
+            isIndeterminate = !isSyncActive && !isSyncPaused && !isSyncCompleted,
+            isPaused = isSyncPaused
+        )
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIFICATION_ID_FOREGROUND,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            )
+        } else {
+            startForeground(NOTIFICATION_ID_FOREGROUND, notification)
+        }
     }
 
     private fun observeRoleAndTelemetry() {
@@ -125,7 +157,25 @@ class HubForegroundService : Service() {
 
         serviceScope.launch {
             relayEngine.telemetry.collectLatest { state ->
-                val roleLabel = if (vault.deviceRole.value == DeviceRole.SECONDARY_HUB) {
+                val isHub = vault.deviceRole.value == DeviceRole.SECONDARY_HUB
+                val isSyncActive = state.isRunning || state.queuedFileCount > 0
+                val isSyncPaused = state.isPaused && (state.queuedFileCount > 0 || state.isRunning)
+                val isSyncCompleted = state.completedSessionFiles > 0 && state.queuedFileCount == 0 && !state.isRunning
+
+                if (!isHub && !isSyncActive && !isSyncPaused && !isSyncCompleted) {
+                    // Sync is idle/stopped on Primary Node -> remove notification & stop service cleanly
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        stopForeground(true)
+                    }
+                    notificationManager.cancel(NOTIFICATION_ID_FOREGROUND)
+                    stopSelf()
+                    return@collectLatest
+                }
+
+                val roleLabel = if (isHub) {
                     "Secondary Hub (Receiver)"
                 } else {
                     "Primary Node (Sender)"
@@ -133,20 +183,32 @@ class HubForegroundService : Service() {
 
                 val progressPercent = (state.activeFileProgress * 100f).roundToInt().coerceIn(0, 100)
                 val speedFormatted = String.format("%.2f MB/s", state.currentSpeedMbps)
-                val bodyText = if (state.isRunning && state.activeFileName != "Idle") {
-                    "${state.activeFileName} • $speedFormatted • Queue: ${state.queuedFileCount}"
-                } else {
-                    "${state.statusBanner} • Completed: ${state.completedSessionFiles}"
+                val bodyText = when {
+                    isSyncCompleted -> "Sync Completed • ${state.completedSessionFiles} files transferred"
+                    isSyncPaused -> "Sync Paused • Queue: ${state.queuedFileCount}"
+                    state.isRunning && state.activeFileName != "Idle" -> "${state.activeFileName} • $speedFormatted • Queue: ${state.queuedFileCount}"
+                    isHub -> "Hub Ready • Listening on TCP :${NetworkAndSafetyMonitor.DEFAULT_HUB_PORT}"
+                    else -> "${state.statusBanner} • Queue: ${state.queuedFileCount}"
                 }
 
                 val updatedNotification = buildTelemetryNotification(
-                    title = "Sync Pro • $roleLabel",
+                    title = if (isSyncCompleted) "AuraSync • Completed" else "AuraSync • $roleLabel",
                     statusText = bodyText,
                     progress = progressPercent,
                     isIndeterminate = false,
-                    isPaused = state.isPaused
+                    isPaused = isSyncPaused
                 )
-                notificationManager.notify(NOTIFICATION_ID_FOREGROUND, updatedNotification)
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    startForeground(
+                        NOTIFICATION_ID_FOREGROUND,
+                        updatedNotification,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or
+                                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                    )
+                } else {
+                    startForeground(NOTIFICATION_ID_FOREGROUND, updatedNotification)
+                }
             }
         }
     }
@@ -162,7 +224,10 @@ class HubForegroundService : Service() {
                 if (wifiLock?.isHeld == false) {
                     runCatching { wifiLock?.acquire() }
                 }
-                val safety = networkMonitor.evaluateHardwareSafetyGuards()
+                val safety = networkMonitor.evaluateHardwareSafetyGuards(
+                    tempCutoff = vault.tempCutoffCelsius.value,
+                    batteryCutoff = vault.batteryCutoffPercent.value
+                )
                 if (safety.isLowStorageTripped && vault.deviceRole.value == DeviceRole.SECONDARY_HUB) {
                     postLowStorageEmergencyNotification()
                 }
@@ -204,14 +269,18 @@ class HubForegroundService : Service() {
                 if (vault.deviceRole.value != DeviceRole.PRIMARY_SENDER) return
 
                 serviceScope.launch(Dispatchers.IO) {
-                    val buckets = vault.enabledBuckets.value
-                    val tasks = MediaAndQrEngine.scanEnabledBucketsForRelay(
+                    val recentTasks = MediaAndQrEngine.queryRecentCaptures(
                         context = applicationContext,
-                        enabledBuckets = buckets,
-                        priorityWeight = 5 // Instant capture gets priority weight 5
+                        withinLastSeconds = 180
                     )
-                    if (tasks.isNotEmpty()) {
-                        relayEngine.enqueueTasks(tasks.take(5), isUrgentInstantUpload = true)
+                    if (recentTasks.isNotEmpty()) {
+                        relayEngine.setPaused(false)
+                        relayEngine.enqueueTasks(recentTasks, isUrgentInstantUpload = true)
+                        relayEngine.logEvent(
+                            "INFO",
+                            "InstantCapture",
+                            "Auto-detected ${recentTasks.size} new camera capture(s), uploaded immediately"
+                        )
                     }
                 }
             }
@@ -236,7 +305,7 @@ class HubForegroundService : Service() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val relayChannel = NotificationChannel(
                 CHANNEL_ID_RELAY,
-                "Sync Pro 24/7 Relay Service",
+                "AuraSync 24/7 Relay Service",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
                 description = "Live transfer telemetry and interactive relay controls"
@@ -245,7 +314,7 @@ class HubForegroundService : Service() {
 
             val emergencyChannel = NotificationChannel(
                 CHANNEL_ID_EMERGENCY,
-                "Sync Pro Storage & Safety Alerts",
+                "AuraSync Storage & Safety Alerts",
                 NotificationManager.IMPORTANCE_HIGH
             ).apply {
                 description = "Critical alerts when Hub storage drops below 1GB or thermal limits trip"
@@ -298,9 +367,18 @@ class HubForegroundService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val exitIntent = Intent(this, SyncNotificationReceiver::class.java).apply {
+            action = SyncNotificationReceiver.ACTION_EXIT
+        }
+        val exitPending = PendingIntent.getBroadcast(
+            this, 104, exitIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val isTransferring = relayEngine.telemetry.value.isRunning && relayEngine.telemetry.value.queuedFileCount > 0
         val pauseActionLabel = if (isPaused) "Resume" else "Pause"
 
-        return NotificationCompat.Builder(this, CHANNEL_ID_RELAY)
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID_RELAY)
             .setSmallIcon(android.R.drawable.stat_sys_upload)
             .setContentTitle(title)
             .setContentText(statusText)
@@ -309,10 +387,16 @@ class HubForegroundService : Service() {
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setProgress(100, progress, isIndeterminate)
-            .addAction(android.R.drawable.ic_popup_sync, "Sync Now", syncNowPending)
-            .addAction(android.R.drawable.ic_media_pause, pauseActionLabel, pauseResumePending)
-            .addAction(android.R.drawable.ic_delete, "Stop", stopSyncPending)
-            .build()
+
+        if (isTransferring) {
+            builder.addAction(android.R.drawable.ic_media_pause, pauseActionLabel, pauseResumePending)
+            builder.addAction(android.R.drawable.ic_delete, "Stop", stopSyncPending)
+        } else {
+            builder.addAction(android.R.drawable.ic_popup_sync, "Sync Now", syncNowPending)
+        }
+        builder.addAction(android.R.drawable.ic_lock_power_off, "Exit", exitPending)
+
+        return builder.build()
     }
 
     private fun postLowStorageEmergencyNotification() {
@@ -323,7 +407,7 @@ class HubForegroundService : Service() {
             .setStyle(
                 NotificationCompat.BigTextStyle().bigText(
                     "Secondary Hub available storage has dropped below the 1 GB safety floor. " +
-                            "Sync Pro has paused incoming payloads until Google Photos Free-Up-Space is run."
+                            "AuraSync has paused incoming payloads until Google Photos Free-Up-Space is run."
                 )
             )
             .setPriority(NotificationCompat.PRIORITY_HIGH)
@@ -363,13 +447,30 @@ class HubForegroundService : Service() {
         const val ACTION_TRIGGER_IMMEDIATE_SCAN = "com.enterprise.syncpro.ACTION_TRIGGER_IMMEDIATE_SCAN"
 
         fun startOrUpdate(context: Context, action: String = ACTION_START_SERVICE) {
+            val vault = VaultManager.getInstance(context)
+            val relay = RelayTransferEngine.getInstance(context)
+            val isHub = vault.deviceRole.value == DeviceRole.SECONDARY_HUB
+            val state = relay.telemetry.value
+            val isSyncActive = state.isRunning || state.queuedFileCount > 0
+            val isSyncPaused = state.isPaused && (state.queuedFileCount > 0 || state.isRunning)
+            val isSyncCompleted = state.completedSessionFiles > 0 && state.queuedFileCount == 0 && !state.isRunning
+
+            // On Primary Node: only start foreground service if actively syncing, paused, completed, or scanning
+            if (!isHub && !isSyncActive && !isSyncPaused && !isSyncCompleted && action == ACTION_START_SERVICE) {
+                return
+            }
+
             val intent = Intent(context, HubForegroundService::class.java).apply {
                 this.action = action
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+            } catch (e: Exception) {
+                // Catch any ForegroundServiceStartNotAllowedException on Android 12+
             }
         }
     }
@@ -392,6 +493,18 @@ class SyncNotificationReceiver : BroadcastReceiver() {
             ACTION_STOP_SYNC -> {
                 relayEngine.clearQueueAndStop()
             }
+            ACTION_EXIT -> {
+                runCatching {
+                    context.stopService(Intent(context, HubForegroundService::class.java))
+                    relayEngine.clearQueueAndStop()
+                    relayEngine.stopSecondaryHubServer()
+                    val networkMonitor = NetworkAndSafetyMonitor.getInstance(context)
+                    networkMonitor.stopMdnsDiscovery()
+                    val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                    notificationManager.cancelAll()
+                    android.os.Process.killProcess(android.os.Process.myPid())
+                }
+            }
             Intent.ACTION_BOOT_COMPLETED -> {
                 HubForegroundService.startOrUpdate(context)
                 SyncWorkers.scheduleDailyAutomatedSync(context)
@@ -403,5 +516,6 @@ class SyncNotificationReceiver : BroadcastReceiver() {
         const val ACTION_SYNC_NOW = "com.enterprise.syncpro.ACTION_SYNC_NOW"
         const val ACTION_PAUSE_RESUME = "com.enterprise.syncpro.ACTION_PAUSE_RESUME"
         const val ACTION_STOP_SYNC = "com.enterprise.syncpro.ACTION_STOP_SYNC"
+        const val ACTION_EXIT = "com.enterprise.syncpro.ACTION_EXIT"
     }
 }

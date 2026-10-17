@@ -37,7 +37,9 @@
 
     <application
         android:allowBackup="false"
-        android:label="Sync Pro"
+        android:label="AuraSync"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.AppCompat.DayNight.NoActionBar"
         tools:targetApi="35">

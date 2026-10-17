@@ -36,7 +36,10 @@ class AutomatedRelayWorker(
             return@withContext Result.success()
         }
 
-        val safety = networkMonitor.evaluateHardwareSafetyGuards()
+        val safety = networkMonitor.evaluateHardwareSafetyGuards(
+            tempCutoff = vault.tempCutoffCelsius.value,
+            batteryCutoff = vault.batteryCutoffPercent.value
+        )
         if (!safety.isSafeToSync) {
             relayEngine.logEvent(
                 "WARN",
@@ -156,7 +159,7 @@ object SyncWorkers {
         val minute = vault.scheduleMinute.value
         val initialDelayMillis = computeInitialDelayMillis(hour, minute)
 
-        val periodicRequest = PeriodicWorkRequestBuilder<AutomatedRelayWorker>(24, TimeUnit.HOURS)
+        val periodicRequest = PeriodicWorkRequestBuilder<AutomatedRelayWorker>(12, TimeUnit.HOURS)
             .setInitialDelay(initialDelayMillis, TimeUnit.MILLISECONDS)
             .setBackoffCriteria(
                 BackoffPolicy.EXPONENTIAL,
@@ -167,7 +170,7 @@ object SyncWorkers {
 
         WorkManager.getInstance(context).enqueueUniquePeriodicWork(
             UNIQUE_DAILY_WORK_NAME,
-            ExistingPeriodicWorkPolicy.UPDATE,
+            ExistingPeriodicWorkPolicy.CANCEL_AND_REENQUEUE,
             periodicRequest
         )
     }

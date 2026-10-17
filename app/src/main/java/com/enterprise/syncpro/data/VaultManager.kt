@@ -45,9 +45,11 @@ data class ExportedConfiguration(
     val restrictToTrustedWifi: Boolean,
     val scheduleHour: Int,
     val scheduleMinute: Int,
-    val daytimeLimitKbps: Int,
+    val daytimeLimitKbps: Int = 0,
     val instantCaptureSync: Boolean,
-    val devicePriorityWeight: Int
+    val devicePriorityWeight: Int,
+    val tempCutoffCelsius: Float = 45.0f,
+    val batteryCutoffPercent: Int = 15
 )
 
 class VaultManager private constructor(context: Context) {
@@ -102,7 +104,7 @@ class VaultManager private constructor(context: Context) {
     private val _scheduleMinute = MutableStateFlow(0)
     val scheduleMinute: StateFlow<Int> = _scheduleMinute.asStateFlow()
 
-    private val _daytimeLimitKbps = MutableStateFlow(2048) // Default 2 MB/s daytime
+    private val _daytimeLimitKbps = MutableStateFlow(0) // Default 0 = Unlimited
     val daytimeLimitKbps: StateFlow<Int> = _daytimeLimitKbps.asStateFlow()
 
     private val _instantCaptureSync = MutableStateFlow(true)
@@ -110,6 +112,12 @@ class VaultManager private constructor(context: Context) {
 
     private val _devicePriorityWeight = MutableStateFlow(3) // 1..5 priority
     val devicePriorityWeight: StateFlow<Int> = _devicePriorityWeight.asStateFlow()
+
+    private val _tempCutoffCelsius = MutableStateFlow(45.0f)
+    val tempCutoffCelsius: StateFlow<Float> = _tempCutoffCelsius.asStateFlow()
+
+    private val _batteryCutoffPercent = MutableStateFlow(15)
+    val batteryCutoffPercent: StateFlow<Int> = _batteryCutoffPercent.asStateFlow()
 
     private val _isPinConfigured = MutableStateFlow(false)
     val isPinConfigured: StateFlow<Boolean> = _isPinConfigured.asStateFlow()
@@ -150,9 +158,11 @@ class VaultManager private constructor(context: Context) {
         _restrictToTrustedWifi.value = encryptedPrefs.getBoolean(KEY_RESTRICT_WIFI, false)
         _scheduleHour.value = encryptedPrefs.getInt(KEY_SCHEDULE_HOUR, 2)
         _scheduleMinute.value = encryptedPrefs.getInt(KEY_SCHEDULE_MINUTE, 0)
-        _daytimeLimitKbps.value = encryptedPrefs.getInt(KEY_DAYTIME_KBPS, 2048)
+        _daytimeLimitKbps.value = encryptedPrefs.getInt(KEY_DAYTIME_KBPS, 0)
         _instantCaptureSync.value = encryptedPrefs.getBoolean(KEY_INSTANT_CAPTURE, true)
         _devicePriorityWeight.value = encryptedPrefs.getInt(KEY_PRIORITY_WEIGHT, 3).coerceIn(1, 5)
+        _tempCutoffCelsius.value = encryptedPrefs.getFloat(KEY_TEMP_CUTOFF, 45.0f)
+        _batteryCutoffPercent.value = encryptedPrefs.getInt(KEY_BATTERY_CUTOFF, 15)
         _isPinConfigured.value = !encryptedPrefs.getString(KEY_PIN_HASH, null).isNullOrBlank()
 
         if (encryptedPrefs.getString(KEY_DEVICE_ID, null) == null) {
@@ -267,9 +277,21 @@ class VaultManager private constructor(context: Context) {
     }
 
     suspend fun setDaytimeLimitKbps(kbps: Int) = withContext(Dispatchers.IO) {
-        val safeKbps = kbps.coerceAtLeast(256)
+        val safeKbps = if (kbps <= 0) 0 else kbps.coerceAtLeast(256)
         encryptedPrefs.edit().putInt(KEY_DAYTIME_KBPS, safeKbps).commit()
         _daytimeLimitKbps.value = safeKbps
+    }
+
+    suspend fun setTempCutoff(temp: Float) = withContext(Dispatchers.IO) {
+        val safeTemp = temp.coerceIn(30.0f, 60.0f)
+        encryptedPrefs.edit().putFloat(KEY_TEMP_CUTOFF, safeTemp).commit()
+        _tempCutoffCelsius.value = safeTemp
+    }
+
+    suspend fun setBatteryCutoff(percent: Int) = withContext(Dispatchers.IO) {
+        val safePercent = percent.coerceIn(5, 50)
+        encryptedPrefs.edit().putInt(KEY_BATTERY_CUTOFF, safePercent).commit()
+        _batteryCutoffPercent.value = safePercent
     }
 
     suspend fun setInstantCaptureSync(enabled: Boolean) = withContext(Dispatchers.IO) {
@@ -295,7 +317,9 @@ class VaultManager private constructor(context: Context) {
             scheduleMinute = _scheduleMinute.value,
             daytimeLimitKbps = _daytimeLimitKbps.value,
             instantCaptureSync = _instantCaptureSync.value,
-            devicePriorityWeight = _devicePriorityWeight.value
+            devicePriorityWeight = _devicePriorityWeight.value,
+            tempCutoffCelsius = _tempCutoffCelsius.value,
+            batteryCutoffPercent = _batteryCutoffPercent.value
         )
         json.encodeToString(config)
     }
@@ -306,15 +330,18 @@ class VaultManager private constructor(context: Context) {
             setDeviceRole(DeviceRole.valueOf(config.role))
             setDarkMode(config.isDarkMode)
             config.pairedToken?.let { savePairingToken(it) }
+            val safeKbps = if (config.daytimeLimitKbps <= 0) 0 else config.daytimeLimitKbps.coerceAtLeast(256)
             encryptedPrefs.edit()
                 .putStringSet(KEY_ENABLED_BUCKETS, config.enabledBuckets)
                 .putStringSet(KEY_TRUSTED_SSIDS, config.trustedSsids)
                 .putBoolean(KEY_RESTRICT_WIFI, config.restrictToTrustedWifi)
                 .putInt(KEY_SCHEDULE_HOUR, config.scheduleHour.coerceIn(0, 23))
                 .putInt(KEY_SCHEDULE_MINUTE, config.scheduleMinute.coerceIn(0, 59))
-                .putInt(KEY_DAYTIME_KBPS, config.daytimeLimitKbps.coerceAtLeast(256))
+                .putInt(KEY_DAYTIME_KBPS, safeKbps)
                 .putBoolean(KEY_INSTANT_CAPTURE, config.instantCaptureSync)
                 .putInt(KEY_PRIORITY_WEIGHT, config.devicePriorityWeight.coerceIn(1, 5))
+                .putFloat(KEY_TEMP_CUTOFF, config.tempCutoffCelsius.coerceIn(30f, 60f))
+                .putInt(KEY_BATTERY_CUTOFF, config.batteryCutoffPercent.coerceIn(5, 50))
                 .commit()
             loadInitialVaultState()
             true
@@ -336,6 +363,8 @@ class VaultManager private constructor(context: Context) {
         private const val KEY_DAYTIME_KBPS = "daytime_kbps"
         private const val KEY_INSTANT_CAPTURE = "instant_capture"
         private const val KEY_PRIORITY_WEIGHT = "priority_weight"
+        private const val KEY_TEMP_CUTOFF = "temp_cutoff"
+        private const val KEY_BATTERY_CUTOFF = "battery_cutoff"
         private const val KEY_PIN_HASH = "pin_hash"
 
         @Volatile

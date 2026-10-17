@@ -24,8 +24,18 @@ android {
         }
     }
 
+    signingConfigs {
+        create("release") {
+            storeFile = file("release-test.jks")
+            storePassword = "aurasync_testing"
+            keyAlias = "aurasync"
+            keyPassword = "aurasync_testing"
+        }
+    }
+
     buildTypes {
         release {
+            signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
