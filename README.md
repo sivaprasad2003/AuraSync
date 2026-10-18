@@ -162,7 +162,7 @@ Join our official Telegram community to get setup help, download test builds, sh
 
 ## 👨‍💻 Author & Credits
 
-- **Lead Developer & Architect:** **Siva P** ([@sivap](https://github.com/sivap))
+- **Lead Developer & Architect:** **Sivaprasad** ([@sivaprasad2003](https://github.com/sivaprasad2003))
 - **Community & Updates:** [t.me/AuraSyncapp](https://t.me/AuraSyncapp)
 
 If **AuraSync** saves you cloud storage subscriptions and keeps your memories backed up effortlessly, please consider giving this repository a ⭐ **Star** on GitHub and sharing it with the community!
