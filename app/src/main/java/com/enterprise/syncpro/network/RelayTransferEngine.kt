@@ -66,8 +66,71 @@ data class TransferLiveTelemetry(
     val completedSessionFiles: Int = 0,
     val skippedDuplicateFiles: Int = 0,
     val activeEndpointRoute: String = "Standby",
-    val statusBanner: String = "Engine Ready"
+    val statusBanner: String = "Engine Ready",
+    val sourceDeviceName: String = "",
+    val isHubBusyWithSync: Boolean = false
 )
+
+/**
+ * Secondary Hub FIFO + Priority Queue Gate.
+ * Sequences incoming client sync connections by priority weight (5..1) and FIFO arrival order.
+ */
+private class HubPriorityTransferGate {
+    private val mutex = Mutex()
+    private var activeTransferJobId: Long? = null
+    private var activeDeviceName: String = ""
+    private val waitingQueue = java.util.PriorityQueue<TransferTicket>()
+    private var ticketSequence = 0L
+
+    data class TransferTicket(
+        val sequenceId: Long,
+        val deviceId: String,
+        val deviceName: String,
+        val priorityWeight: Int,
+        val deferred: kotlinx.coroutines.CompletableDeferred<Unit>
+    ) : Comparable<TransferTicket> {
+        override fun compareTo(other: TransferTicket): Int {
+            val pDiff = other.priorityWeight.compareTo(this.priorityWeight)
+            return if (pDiff != 0) pDiff else this.sequenceId.compareTo(other.sequenceId)
+        }
+    }
+
+    suspend fun acquire(deviceId: String, deviceName: String, priorityWeight: Int): Long {
+        val ticket: TransferTicket
+        mutex.withLock {
+            if (activeTransferJobId == null && waitingQueue.isEmpty()) {
+                val jobId = ++ticketSequence
+                activeTransferJobId = jobId
+                activeDeviceName = deviceName
+                return jobId
+            }
+            val deferred = kotlinx.coroutines.CompletableDeferred<Unit>()
+            ticket = TransferTicket(++ticketSequence, deviceId, deviceName, priorityWeight, deferred)
+            waitingQueue.add(ticket)
+        }
+        ticket.deferred.await()
+        return ticket.sequenceId
+    }
+
+    suspend fun release(jobId: Long) {
+        mutex.withLock {
+            if (activeTransferJobId == jobId) {
+                activeTransferJobId = null
+                activeDeviceName = ""
+            }
+            val next = waitingQueue.poll()
+            if (next != null) {
+                activeTransferJobId = next.sequenceId
+                activeDeviceName = next.deviceName
+                next.deferred.complete(Unit)
+            }
+        }
+    }
+
+    suspend fun isBusy(): Pair<Boolean, String> = mutex.withLock {
+        (activeTransferJobId != null) to activeDeviceName
+    }
+}
 
 class RelayTransferEngine private constructor(private val context: Context) {
 
@@ -91,7 +154,22 @@ class RelayTransferEngine private constructor(private val context: Context) {
     private val _uploadQueue = MutableStateFlow<List<RelayQueueTask>>(emptyList())
     val uploadQueue: StateFlow<List<RelayQueueTask>> = _uploadQueue.asStateFlow()
 
+    private val hubDeviceConfigTimestamps = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    fun markHubDeviceConfigUpdated(deviceId: String, timestamp: Long = System.currentTimeMillis()) {
+        hubDeviceConfigTimestamps[deviceId] = timestamp
+    }
+
     var onLowStorageEmergencyCallback: (() -> Unit)? = null
+    var onSafetyAlertReceived: ((String) -> Unit)? = null
+    private val hubTransferGate = HubPriorityTransferGate()
+
+    private fun formatBytes(bytes: Long): String {
+        if (bytes <= 0) return "0 B"
+        val units = arrayOf("B", "KB", "MB", "GB", "TB")
+        val digitGroups = (Math.log10(bytes.toDouble()) / Math.log10(1024.0)).toInt().coerceIn(0, units.size - 1)
+        return String.format(java.util.Locale.US, "%.1f %s", bytes / Math.pow(1024.0, digitGroups.toDouble()), units[digitGroups])
+    }
 
     init {
         ioScope.launch {
@@ -211,9 +289,7 @@ class RelayTransferEngine private constructor(private val context: Context) {
         serverJob = ioScope.launch {
             runCatching {
                 val deviceId = vault.getOrCreateDeviceId()
-                val secretHex = vault.getOrCreateHubSecretHex()
-                val pinHash = vault.getPinHashOrDefault()
-                networkMonitor.startMdnsHubBroadcast(port, deviceId, secretHex, pinHash)
+                networkMonitor.startMdnsHubBroadcast(port, deviceId)
                 serverSocket = ServerSocket().apply {
                     reuseAddress = true
                     bind(InetSocketAddress("0.0.0.0", port))
@@ -267,6 +343,106 @@ class RelayTransferEngine private constructor(private val context: Context) {
 
             val handshakeLine = reader.readLine() ?: return@withContext
             val parts = handshakeLine.split("|")
+            if (parts[0] == "SAFETY_ALERT") {
+                val senderName = parts.getOrNull(1) ?: "Primary Node"
+                val reason = parts.getOrNull(2) ?: "Safety Limit Tripped"
+                val alertText = "$senderName Alert: $reason".trim()
+                onSafetyAlertReceived?.invoke(alertText)
+                logEvent("WARN", "SafetyAlert", alertText)
+                writer.println("ALERT_ACK")
+                return@withContext
+            }
+            if (parts[0] == "UPDATE_DEVICE_CONFIG") {
+                val targetDeviceId = parts.getOrNull(1) ?: ""
+                val bandwidthKbps = parts.getOrNull(2)?.toIntOrNull() ?: 0
+                val scheduleHour = parts.getOrNull(3)?.toIntOrNull() ?: 2
+                val scheduleMinute = parts.getOrNull(4)?.toIntOrNull() ?: 0
+                val configTimestamp = parts.getOrNull(5)?.toLongOrNull() ?: System.currentTimeMillis()
+                val scheduleStr = format12HourTime(scheduleHour, scheduleMinute)
+
+                // Global update: sync settings across all devices
+                dao.updateAllDevicesScheduleAndBandwidth(bandwidthKbps, scheduleHour, scheduleMinute, scheduleStr, configTimestamp)
+                vault.setDaytimeLimitKbps(bandwidthKbps, updateTimestamp = false)
+                vault.setDailySchedule(scheduleHour, scheduleMinute, updateTimestamp = false)
+                vault.setConfigTimestamp(configTimestamp)
+
+                writer.println("CONFIG_UPDATED")
+                logEvent("INFO", "ConfigSync", "Global settings synchronized across all devices: cap=${bandwidthKbps}KB/s, schedule=$scheduleStr")
+                return@withContext
+            }
+            if (parts[0] == "QUERY_HUB_PEERS" || parts[0] == "REGISTER_CLIENT") {
+                val clientDeviceId = parts.getOrNull(1)
+                if (!clientDeviceId.isNullOrBlank()) {
+                    val clientDeviceName = parts.getOrNull(2)?.ifBlank { "Primary Sender" } ?: "Primary Sender"
+                    val clientScheduleHour = parts.getOrNull(3)?.toIntOrNull() ?: 2
+                    val clientScheduleMinute = parts.getOrNull(4)?.toIntOrNull() ?: 0
+                    val clientBandwidth = parts.getOrNull(5)?.toIntOrNull() ?: 0
+                    val clientTraffic = parts.getOrNull(6)?.toLongOrNull() ?: 0L
+                    val clientConfigTs = parts.getOrNull(7)?.toLongOrNull() ?: 0L
+                    val clientIp = client.inetAddress?.hostAddress ?: "Wi-Fi LAN"
+
+                    // Clean up any stale duplicate devices with the same IP or name
+                    dao.deleteDuplicates(clientDeviceId, clientIp, clientDeviceName)
+
+                    val existing = dao.getConnectedDevice(clientDeviceId) ?: dao.getConnectedDeviceByIp(clientIp)
+                    val canonicalId = existing?.deviceId ?: clientDeviceId
+                    val hubConfigTs = hubDeviceConfigTimestamps[canonicalId]
+                        ?: (if (clientIp.isNotBlank()) hubDeviceConfigTimestamps[clientIp] else null)
+                        ?: existing?.configUpdatedAt
+                        ?: 0L
+
+                    val scheduleHour: Int
+                    val scheduleMinute: Int
+                    val bandwidth: Int
+                    val effectiveTs: Long
+
+                    if (clientConfigTs >= hubConfigTs) {
+                        scheduleHour = clientScheduleHour
+                        scheduleMinute = clientScheduleMinute
+                        bandwidth = clientBandwidth
+                        effectiveTs = clientConfigTs
+                        hubDeviceConfigTimestamps[canonicalId] = clientConfigTs
+                        if (clientIp.isNotBlank()) hubDeviceConfigTimestamps[clientIp] = clientConfigTs
+                    } else {
+                        scheduleHour = existing?.scheduleHour ?: clientScheduleHour
+                        scheduleMinute = existing?.scheduleMinute ?: clientScheduleMinute
+                        bandwidth = existing?.bandwidthLimitKbps ?: clientBandwidth
+                        effectiveTs = hubConfigTs
+                    }
+                    val scheduleStr = format12HourTime(scheduleHour, scheduleMinute)
+
+                    dao.upsertConnectedDevice(
+                        com.enterprise.syncpro.data.ConnectedDeviceEntity(
+                            deviceId = canonicalId,
+                            deviceName = clientDeviceName,
+                            ipAddress = clientIp,
+                            role = "PRIMARY_SENDER",
+                            scheduledSync = scheduleStr,
+                            scheduleHour = scheduleHour,
+                            scheduleMinute = scheduleMinute,
+                            bandwidthLimitKbps = bandwidth,
+                            throttleStartHour = existing?.throttleStartHour ?: 2,
+                            throttleStartMinute = existing?.throttleStartMinute ?: 0,
+                            throttleEndHour = existing?.throttleEndHour ?: 5,
+                            throttleEndMinute = existing?.throttleEndMinute ?: 0,
+                            syncStatus = existing?.syncStatus ?: "Connected (Wi-Fi)",
+                            trafficBytes = (existing?.trafficBytes ?: 0L).coerceAtLeast(clientTraffic),
+                            configUpdatedAt = effectiveTs,
+                            lastSeen = System.currentTimeMillis(),
+                            lastSyncedAt = existing?.lastSyncedAt ?: 0L
+                        )
+                    )
+                }
+                val devices = dao.getConnectedDevicesList()
+                val (isBusy, busyWithDevice) = hubTransferGate.isBusy()
+                val hubSyncState = if (isBusy) "Syncing (with $busyWithDevice)" else "Free (Standby)"
+                val devListPayload = devices.joinToString(";") { dev ->
+                    val devTs = hubDeviceConfigTimestamps[dev.deviceId] ?: dev.configUpdatedAt
+                    "${dev.deviceId}#${dev.deviceName}#${dev.ipAddress}#${dev.role}#${dev.scheduledSync}#${dev.bandwidthLimitKbps}#${dev.syncStatus}#${dev.trafficBytes}#${dev.lastSeen}#${dev.scheduleHour}#${dev.scheduleMinute}#$devTs#${dev.lastSyncedAt}"
+                }
+                writer.println("PEERS_RESULT|${devices.size}|$devListPayload|$hubSyncState")
+                return@withContext
+            }
             if (parts.size < 6 || parts[0] != "PREFLIGHT") {
                 writer.println("REJECT_MALFORMED")
                 return@withContext
@@ -275,15 +451,29 @@ class RelayTransferEngine private constructor(private val context: Context) {
             val sha256 = parts[1]
             val originalName = parts[2]
             val fileSize = parts[3].toLongOrNull() ?: 0L
-            val sourceDevice = parts[4]
+            val sourceDeviceId = parts[4]
             val clientAuthTag = parts[5]
+            val sourceDeviceFriendlyName = parts.getOrNull(6) ?: sourceDeviceId
+            val clientPriority = parts.getOrNull(7)?.toIntOrNull() ?: 3
+            val clientIp = client.inetAddress?.hostAddress ?: "Wi-Fi LAN"
 
-            // Hub Low-Storage Emergency Safeguard (< 1GB free)
-            val safety = networkMonitor.evaluateHardwareSafetyGuards()
-            if (safety.isLowStorageTripped || (safety.availableStorageBytes - fileSize) < NetworkAndSafetyMonitor.ONE_GIGABYTE_BYTES) {
-                writer.println("REJECT_LOW_STORAGE")
-                logEvent("ERROR", "StorageGuard", "Rejected $originalName: Hub free storage below 1GB threshold!")
+            // Hub Hardware Safety Safeguards (Thermal, Battery, and Editable Free Storage Cutoff)
+            val safety = networkMonitor.evaluateHardwareSafetyGuards(
+                tempCutoff = vault.tempCutoffCelsius.value,
+                batteryCutoff = vault.batteryCutoffPercent.value,
+                storageCutoffGb = vault.storageCutoffGb.value
+            )
+            val cutoffBytes = (vault.storageCutoffGb.value * 1024L * 1024L * 1024L).toLong()
+            if (!safety.isSafeToSync || (safety.availableStorageBytes - fileSize) < cutoffBytes) {
+                val reason = when {
+                    safety.isThermalTripped -> "Hub temperature (${String.format(java.util.Locale.US, "%.1f", safety.temperatureCelsius)}°C) exceeds cutoff (${vault.tempCutoffCelsius.value}°C)"
+                    safety.isLowBatteryTripped -> "Hub battery (${safety.batteryPercent}%) is below cutoff (${vault.batteryCutoffPercent.value}%)"
+                    else -> "Hub storage (${formatBytes(safety.availableStorageBytes)}) is below cutoff (${vault.storageCutoffGb.value} GB)"
+                }
+                writer.println("REJECT_SAFETY_LIMIT|$reason")
+                logEvent("ERROR", "StorageGuard", "Rejected $originalName: $reason")
                 onLowStorageEmergencyCallback?.invoke()
+                onSafetyAlertReceived?.invoke("Hub Safety Limit: Rejected incoming sync ($reason)")
                 return@withContext
             }
 
@@ -292,21 +482,40 @@ class RelayTransferEngine private constructor(private val context: Context) {
             val expectedTag = CryptoEngine.computeHandshakeAuthTag(secretHex, pinHash, sha256, fileSize)
             if (!expectedTag.equals(clientAuthTag, ignoreCase = true)) {
                 writer.println("REJECT_AUTH")
-                logEvent("SECURITY", "HubAuth", "Rejected unauthorized transfer from $sourceDevice")
+                logEvent("SECURITY", "HubAuth", "Rejected unauthorized transfer from $sourceDeviceId")
                 return@withContext
             }
 
+            // Clean up any duplicate records for this device
+            dao.deleteDuplicates(sourceDeviceId, clientIp, sourceDeviceFriendlyName)
+
+            val existingDev = dao.getConnectedDevice(sourceDeviceId) ?: dao.getConnectedDeviceByIp(clientIp)
+            val canonicalDeviceId = existingDev?.deviceId ?: sourceDeviceId
+            val canonicalDeviceName = existingDev?.deviceName ?: sourceDeviceFriendlyName
+            val devScheduleHour = existingDev?.scheduleHour ?: 2
+            val devScheduleMinute = existingDev?.scheduleMinute ?: 0
+            val devBandwidth = existingDev?.bandwidthLimitKbps ?: 0
+
+            // Change state WITHIN THAT BOX to "Receiving $originalName"
             dao.upsertConnectedDevice(
                 com.enterprise.syncpro.data.ConnectedDeviceEntity(
-                    deviceId = sourceDevice,
-                    deviceName = "Primary Node ($sourceDevice)",
-                    ipAddress = client.inetAddress?.hostAddress ?: "Wi-Fi LAN",
+                    deviceId = canonicalDeviceId,
+                    deviceName = canonicalDeviceName,
+                    ipAddress = clientIp,
                     role = "PRIMARY_SENDER",
-                    scheduledSync = "Every 12h",
-                    bandwidthLimitKbps = 0,
+                    scheduledSync = existingDev?.scheduledSync ?: format12HourTime(devScheduleHour, devScheduleMinute),
+                    scheduleHour = devScheduleHour,
+                    scheduleMinute = devScheduleMinute,
+                    bandwidthLimitKbps = devBandwidth,
+                    throttleStartHour = existingDev?.throttleStartHour ?: 2,
+                    throttleStartMinute = existingDev?.throttleStartMinute ?: 0,
+                    throttleEndHour = existingDev?.throttleEndHour ?: 5,
+                    throttleEndMinute = existingDev?.throttleEndMinute ?: 0,
                     syncStatus = "Receiving $originalName",
-                    trafficBytes = fileSize,
-                    lastSeen = System.currentTimeMillis()
+                    trafficBytes = (existingDev?.trafficBytes ?: 0L) + fileSize,
+                    configUpdatedAt = existingDev?.configUpdatedAt ?: 0L,
+                    lastSeen = System.currentTimeMillis(),
+                    lastSyncedAt = existingDev?.lastSyncedAt ?: 0L
                 )
             )
 
@@ -326,7 +535,7 @@ class RelayTransferEngine private constructor(private val context: Context) {
                                 savedUri = localEntity.filePath,
                                 finalFileName = localEntity.fileName,
                                 fileSize = localEntity.fileSize,
-                                sourceDevice = sourceDevice,
+                                sourceDevice = canonicalDeviceName,
                                 receivedAt = System.currentTimeMillis()
                             )
                         )
@@ -344,9 +553,6 @@ class RelayTransferEngine private constructor(private val context: Context) {
                     targetFileSize = fileSize
                 )
                 if (existingMatch != null) {
-                    // Photo ALREADY EXISTS on this phone!
-                    // DO NOT copy to DCIM/Camera, DO NOT duplicate!
-                    // Apply token/keys to deduplication registry and acknowledge
                     hubHandshakeMutex.withLock {
                         dao.registerHubReceivedFile(
                             HubDeduplicationEntity(
@@ -354,7 +560,7 @@ class RelayTransferEngine private constructor(private val context: Context) {
                                 savedUri = existingMatch.contentUri,
                                 finalFileName = existingMatch.fileName,
                                 fileSize = existingMatch.fileSize,
-                                sourceDevice = sourceDevice,
+                                sourceDevice = canonicalDeviceName,
                                 receivedAt = System.currentTimeMillis()
                             )
                         )
@@ -381,6 +587,7 @@ class RelayTransferEngine private constructor(private val context: Context) {
             }
 
             if (alreadyExistsOnHub) {
+                dao.updateDeviceStatus(canonicalDeviceId, "Connected (Wi-Fi)")
                 writer.println("SKIP_DUPLICATE")
                 _telemetry.value = _telemetry.value.copy(
                     skippedDuplicateFiles = _telemetry.value.skippedDuplicateFiles + 1,
@@ -389,80 +596,99 @@ class RelayTransferEngine private constructor(private val context: Context) {
                 return@withContext
             }
 
-            writer.println("PROCEED_STREAM")
-
-            // Atomic Temporary File Write (.tmp_[sha256]_[filename])
-            val stagingDir = File(context.cacheDir, "hub_atomic_staging").apply { mkdirs() }
-            val tempFile = File(stagingDir, ".tmp_${sha256.take(12)}_${ originalName.replace(Regex("[^a-zA-Z0-9._-]"), "_") }")
-
+            // Priority Queue & FIFO Gate: Acquire transfer permit before streaming
+            val transferJobId = hubTransferGate.acquire(canonicalDeviceId, canonicalDeviceName, clientPriority)
             try {
-                val decryptedStream = CryptoEngine.wrapDecryptedInputStream(rawIn, secretHex, sha256)
-                val buffer = ByteArray(CryptoEngine.CHUNK_SIZE_64KB)
-                var totalReceived = 0L
-                val startTime = System.currentTimeMillis()
+                _telemetry.value = _telemetry.value.copy(
+                    sourceDeviceName = canonicalDeviceName,
+                    isHubBusyWithSync = true
+                )
+                writer.println("PROCEED_STREAM")
 
-                FileOutputStream(tempFile).use { fos ->
-                    while (totalReceived < fileSize) {
-                        val toRead = minOf(
-                            CryptoEngine.CHUNK_SIZE_64KB.toLong(),
-                            fileSize - totalReceived
-                        ).toInt()
-                        val readCount = decryptedStream.read(buffer, 0, toRead)
-                        if (readCount == -1) break
-                        fos.write(buffer, 0, readCount)
-                        totalReceived += readCount
+                // Atomic Temporary File Write (.tmp_[sha256]_[filename])
+                val stagingDir = File(context.cacheDir, "hub_atomic_staging").apply { mkdirs() }
+                val tempFile = File(stagingDir, ".tmp_${sha256.take(12)}_${ originalName.replace(Regex("[^a-zA-Z0-9._-]"), "_") }")
 
-                        val elapsedSec = ((System.currentTimeMillis() - startTime).coerceAtLeast(1L)) / 1000f
-                        val mbps = ((totalReceived / (1024f * 1024f)) / elapsedSec)
-                        _telemetry.value = _telemetry.value.copy(
-                            activeFileName = originalName,
-                            activeFileProgress = (totalReceived.toFloat() / fileSize.coerceAtLeast(1L)).coerceIn(0f, 1f),
-                            currentSpeedMbps = mbps,
-                            statusBanner = "Receiving $originalName from $sourceDevice"
-                        )
-                    }
-                    fos.fd.sync()
-                }
+                try {
+                    val decryptedStream = CryptoEngine.wrapDecryptedInputStream(rawIn, secretHex, sha256)
+                    val buffer = ByteArray(CryptoEngine.CHUNK_SIZE_64KB)
+                    var totalReceived = 0L
+                    val startTime = System.currentTimeMillis()
 
-                // Post-stream SHA-256 verification before MediaStore commit
-                val verifiedHash = CryptoEngine.computeFileSha256Chunked(tempFile)
-                if (!verifiedHash.equals(sha256, ignoreCase = true)) {
-                    tempFile.delete()
-                    writer.println("ERR_CHECKSUM_MISMATCH")
-                    logEvent("ERROR", "Integrity", "Checksum mismatch for $originalName. Temp file purged.")
-                    return@withContext
-                }
+                    FileOutputStream(tempFile).use { fos ->
+                        while (totalReceived < fileSize) {
+                            val toRead = minOf(
+                                CryptoEngine.CHUNK_SIZE_64KB.toLong(),
+                                fileSize - totalReceived
+                            ).toInt()
+                            val readCount = decryptedStream.read(buffer, 0, toRead)
+                            if (readCount == -1) break
+                            fos.write(buffer, 0, readCount)
+                            totalReceived += readCount
 
-                val collisionSafeName = CryptoEngine.buildCollisionSafeFileName(originalName, sha256)
-                val savedUri = commitVerifiedFileToMediaStoreDcim(tempFile, collisionSafeName)
-                tempFile.delete()
-
-                if (savedUri != null) {
-                    hubHandshakeMutex.withLock {
-                        dao.registerHubReceivedFile(
-                            HubDeduplicationEntity(
-                                sha256 = sha256,
-                                savedUri = savedUri,
-                                finalFileName = collisionSafeName,
-                                fileSize = fileSize,
-                                sourceDevice = sourceDevice,
-                                receivedAt = System.currentTimeMillis()
+                            val elapsedSec = ((System.currentTimeMillis() - startTime).coerceAtLeast(1L)) / 1000f
+                            val mbps = ((totalReceived / (1024f * 1024f)) / elapsedSec)
+                            _telemetry.value = _telemetry.value.copy(
+                                activeFileName = originalName,
+                                activeFileProgress = (totalReceived.toFloat() / fileSize.coerceAtLeast(1L)).coerceIn(0f, 1f),
+                                currentSpeedMbps = mbps,
+                                sourceDeviceName = canonicalDeviceName,
+                                statusBanner = "Receiving $originalName from $canonicalDeviceName"
                             )
-                        )
+                        }
+                        fos.fd.sync()
                     }
-                    writer.println("ACK_COMMITTED")
-                    _telemetry.value = _telemetry.value.copy(
-                        activeFileProgress = 1f,
-                        completedSessionFiles = _telemetry.value.completedSessionFiles + 1,
-                        statusBanner = "Saved to DCIM/Camera: $collisionSafeName"
-                    )
-                    logEvent("INFO", "HubCommit", "Atomically committed $collisionSafeName to DCIM/Camera")
-                } else {
-                    writer.println("ERR_MEDIASTORE_COMMIT")
+
+                    // Post-stream SHA-256 verification before MediaStore commit
+                    val verifiedHash = CryptoEngine.computeFileSha256Chunked(tempFile)
+                    if (!verifiedHash.equals(sha256, ignoreCase = true)) {
+                        tempFile.delete()
+                        writer.println("ERR_CHECKSUM_MISMATCH")
+                        logEvent("ERROR", "Integrity", "Checksum mismatch for $originalName. Temp file purged.")
+                        return@withContext
+                    }
+
+                    val collisionSafeName = CryptoEngine.buildCollisionSafeFileName(originalName, sha256)
+                    val savedUri = commitVerifiedFileToMediaStoreDcim(tempFile, collisionSafeName)
+                    tempFile.delete()
+
+                    if (savedUri != null) {
+                        val commitTs = System.currentTimeMillis()
+                        hubHandshakeMutex.withLock {
+                            dao.registerHubReceivedFile(
+                                HubDeduplicationEntity(
+                                    sha256 = sha256,
+                                    savedUri = savedUri,
+                                    finalFileName = collisionSafeName,
+                                    fileSize = fileSize,
+                                    sourceDevice = canonicalDeviceName,
+                                    receivedAt = commitTs
+                                )
+                            )
+                        }
+                        dao.recordDeviceTrafficAndSync(canonicalDeviceId, fileSize, "Connected", commitTs)
+                        writer.println("ACK_COMMITTED")
+                        _telemetry.value = _telemetry.value.copy(
+                            activeFileProgress = 1f,
+                            completedSessionFiles = _telemetry.value.completedSessionFiles + 1,
+                            statusBanner = "Saved to DCIM/Camera: $collisionSafeName"
+                        )
+                        logEvent("INFO", "HubCommit", "Atomically committed $collisionSafeName to DCIM/Camera")
+                    } else {
+                        writer.println("ERR_MEDIASTORE_COMMIT")
+                    }
+                } catch (e: Exception) {
+                    tempFile.delete()
+                    logEvent("ERROR", "HubReceive", "Interrupted stream for $originalName:${e.message}")
                 }
-            } catch (e: Exception) {
-                tempFile.delete()
-                logEvent("ERROR", "HubReceive", "Interrupted stream for $originalName:${e.message}")
+            } finally {
+                hubTransferGate.release(transferJobId)
+                val (stillBusy, activeDevice) = hubTransferGate.isBusy()
+                _telemetry.value = _telemetry.value.copy(
+                    sourceDeviceName = activeDevice,
+                    isHubBusyWithSync = stillBusy
+                )
+                dao.updateDeviceStatus(canonicalDeviceId, "Connected (Wi-Fi)")
             }
         }
     }
@@ -679,30 +905,44 @@ class RelayTransferEngine private constructor(private val context: Context) {
                         sha256 = sha256,
                         fileSize = task.fileSize
                     )
-                    val deviceName = Build.MODEL.replace("|", "_")
+                    val clientDeviceId = vault.getOrCreateDeviceId()
+                    val clientDeviceName = vault.getDeviceFriendlyName().replace("|", "_")
 
-                    // Tier 2: Pre-Flight Handshake
+                    // Tier 2: Pre-Flight Handshake (includes device priority weight)
                     val handshakePayload = listOf(
                         "PREFLIGHT",
                         sha256,
                         task.fileName,
                         task.fileSize.toString(),
-                        deviceName,
-                        authTag
+                        clientDeviceId,
+                        authTag,
+                        clientDeviceName,
+                        task.priorityWeight.toString()
                     ).joinToString("|")
                     writer.println(handshakePayload)
                     val hubResponse = reader.readLine() ?: return@use false
 
-                    when (hubResponse) {
-                        "SKIP_DUPLICATE" -> {
+                    when {
+                        hubResponse.startsWith("REJECT_SAFETY_LIMIT") -> {
+                            val reason = hubResponse.substringAfter("|", "Safety limit exceeded on Secondary Hub")
+                            setPaused(true)
+                            onSafetyAlertReceived?.invoke(reason)
+                            _telemetry.value = _telemetry.value.copy(
+                                statusBanner = "Paused: $reason"
+                            )
+                            logEvent("WARN", "SafetyLimit", "Hub rejected: $reason")
+                            return@use false
+                        }
+                        hubResponse == "SKIP_DUPLICATE" -> {
                             dao.markLocalFileSynced(sha256)
+                            dao.markDeviceSynced(token.hubDeviceId, "Connected", System.currentTimeMillis())
                             _telemetry.value = _telemetry.value.copy(
                                 skippedDuplicateFiles = _telemetry.value.skippedDuplicateFiles + 1,
                                 statusBanner = "Tier-2 Hub Deduplicated: ${task.fileName}"
                             )
                             return@use true
                         }
-                        "REJECT_LOW_STORAGE" -> {
+                        hubResponse == "REJECT_LOW_STORAGE" -> {
                             setPaused(true)
                             onLowStorageEmergencyCallback?.invoke()
                             _telemetry.value = _telemetry.value.copy(
@@ -711,7 +951,7 @@ class RelayTransferEngine private constructor(private val context: Context) {
                             logEvent("ERROR", "HubStorage", "Hub storage < 1GB! Transfer paused.")
                             return@use false
                         }
-                        "REJECT_AUTH" -> {
+                        hubResponse == "REJECT_AUTH" -> {
                             setPaused(true)
                             _telemetry.value = _telemetry.value.copy(
                                 statusBanner = "Auth Failed: Please re-scan Hub QR Code or Re-connect."
@@ -719,7 +959,7 @@ class RelayTransferEngine private constructor(private val context: Context) {
                             logEvent("SECURITY", "Handshake", "Hub rejected pairing token/PIN.")
                             return@use false
                         }
-                        "PROCEED_STREAM" -> {
+                        hubResponse == "PROCEED_STREAM" -> {
                             // Stream E2EE payload in strict 64KB chunks with Daytime/Nighttime throttling
                             val encryptedOut = CryptoEngine.wrapEncryptedOutputStream(
                                 rawOut,
@@ -757,6 +997,7 @@ class RelayTransferEngine private constructor(private val context: Context) {
                             val commitAck = reader.readLine()
                             if (commitAck == "ACK_COMMITTED") {
                                 dao.markLocalFileSynced(sha256)
+                                dao.markDeviceSynced(token.hubDeviceId, "Connected", System.currentTimeMillis())
                                 _telemetry.value = _telemetry.value.copy(
                                     completedSessionFiles = _telemetry.value.completedSessionFiles + 1,
                                     activeFileProgress = 1f,
@@ -785,15 +1026,26 @@ class RelayTransferEngine private constructor(private val context: Context) {
     }
 
     /**
-     * Bandwidth Throttling & Time-Based Rules:
-     * Uncapped between 02:00 AM and 06:00 AM; capped to user-configured KB/s during daytime.
+     * Bandwidth Throttling & Configurable Time-Based Rules:
+     * Capped to user-configured KB/s during configured timer window; uncapped at full speed outside window.
      */
     private suspend fun applyTimeBasedBandwidthThrottle(bytesSentSoFar: Long, transferStartMs: Long) {
-        val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
-        if (hour in 2..5) return // Uncapped Night Window (02:00 AM - 05:59 AM)
-
         val limitKbps = vault.daytimeLimitKbps.value
         if (limitKbps <= 0 || limitKbps >= 100_000) return
+
+        val now = Calendar.getInstance()
+        val currentMinutesOfDay = now.get(Calendar.HOUR_OF_DAY) * 60 + now.get(Calendar.MINUTE)
+        val startMinutes = vault.throttleStartHour.value * 60 + vault.throttleStartMinute.value
+        val endMinutes = vault.throttleEndHour.value * 60 + vault.throttleEndMinute.value
+
+        val isThrottled = if (startMinutes <= endMinutes) {
+            currentMinutesOfDay in startMinutes until endMinutes
+        } else {
+            // Window wraps around midnight (e.g. 20:00 to 06:00)
+            currentMinutesOfDay >= startMinutes || currentMinutesOfDay < endMinutes
+        }
+
+        if (!isThrottled) return // Outside configured timer window: Uncapped Full Speed!
 
         val allowedBytesPerMs = (limitKbps * 1024.0) / 1000.0
         val expectedElapsedMs = (bytesSentSoFar / allowedBytesPerMs).toLong()
@@ -802,6 +1054,139 @@ class RelayTransferEngine private constructor(private val context: Context) {
         if (sleepNeeded > 15L) {
             delay(sleepNeeded.coerceAtMost(500L))
         }
+    }
+
+    private fun format12HourTime(hour: Int, minute: Int): String {
+        val amPm = if (hour < 12) "AM" else "PM"
+        val displayHour = when {
+            hour == 0 -> 12
+            hour > 12 -> hour - 12
+            else -> hour
+        }
+        return String.format("%02d:%02d %s", displayHour, minute, amPm)
+    }
+
+    /**
+     * Registers this client and queries the Secondary Hub for its connected client peers and returns them.
+     */
+    suspend fun queryHubPeers(
+        token: PairingToken,
+        clientDeviceId: String = "",
+        clientDeviceName: String = "",
+        scheduleHour: Int = 2,
+        scheduleMinute: Int = 0,
+        bandwidthLimitKbps: Int = 0,
+        trafficBytes: Long = 0L,
+        clientConfigTimestamp: Long = 0L
+    ): List<com.enterprise.syncpro.data.ConnectedDeviceEntity> = withContext(Dispatchers.IO) {
+        val results = mutableListOf<com.enterprise.syncpro.data.ConnectedDeviceEntity>()
+        val candidates = listOf(token.localIp, token.tailscaleOrWanHost).filter { it.isNotBlank() && it != "0.0.0.0" }
+        for (host in candidates) {
+            try {
+                Socket().use { socket ->
+                    socket.soTimeout = 3000
+                    socket.connect(InetSocketAddress(host, token.port), 3000)
+                    val writer = PrintWriter(socket.getOutputStream(), true)
+                    val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
+                    writer.println("QUERY_HUB_PEERS|$clientDeviceId|$clientDeviceName|$scheduleHour|$scheduleMinute|$bandwidthLimitKbps|$trafficBytes|$clientConfigTimestamp")
+                    val response = reader.readLine()
+                    if (response != null && response.startsWith("PEERS_RESULT|")) {
+                        val tokens = response.split("|")
+                        if (tokens.size >= 3 && tokens[2].isNotEmpty()) {
+                            val rawList = tokens[2].split(";")
+                            for (item in rawList) {
+                                val fields = item.split("#")
+                                if (fields.size >= 8) {
+                                    results.add(
+                                        com.enterprise.syncpro.data.ConnectedDeviceEntity(
+                                            deviceId = fields[0],
+                                            deviceName = fields[1],
+                                            ipAddress = fields[2],
+                                            role = fields[3],
+                                            scheduledSync = fields[4],
+                                            bandwidthLimitKbps = fields[5].toIntOrNull() ?: 0,
+                                            syncStatus = fields[6],
+                                            trafficBytes = fields[7].toLongOrNull() ?: 0L,
+                                            lastSeen = fields.getOrNull(8)?.toLongOrNull() ?: System.currentTimeMillis(),
+                                            scheduleHour = fields.getOrNull(9)?.toIntOrNull() ?: 2,
+                                            scheduleMinute = fields.getOrNull(10)?.toIntOrNull() ?: 0,
+                                            configUpdatedAt = fields.getOrNull(11)?.toLongOrNull() ?: 0L,
+                                            lastSyncedAt = fields.getOrNull(12)?.toLongOrNull() ?: 0L
+                                        )
+                                    )
+                                }
+                            }
+                        }
+                        val hubState = tokens.getOrNull(3)
+                        if (!hubState.isNullOrBlank()) {
+                            dao.updateDeviceStatus(token.hubDeviceId, hubState)
+                        }
+                        return@withContext results
+                    }
+                }
+            } catch (e: Exception) {
+                // Try next candidate endpoint
+            }
+        }
+        results
+    }
+
+    /**
+     * Sends a real-time safety limit alert over socket to notify the peer device.
+     */
+    suspend fun sendSafetyAlertToHub(
+        token: PairingToken,
+        deviceName: String,
+        reason: String,
+        value: String = ""
+    ): Boolean = withContext(Dispatchers.IO) {
+        val candidates = listOf(token.localIp, token.tailscaleOrWanHost).filter { it.isNotBlank() && it != "0.0.0.0" }
+        for (host in candidates) {
+            try {
+                Socket().use { socket ->
+                    socket.soTimeout = 3000
+                    socket.connect(InetSocketAddress(host, token.port), 3000)
+                    val writer = PrintWriter(socket.getOutputStream(), true)
+                    writer.println("SAFETY_ALERT|$deviceName|$reason|$value")
+                    return@withContext true
+                }
+            } catch (e: Exception) {
+                // Try next candidate
+            }
+        }
+        false
+    }
+
+    /**
+     * Synchronizes updated device bandwidth and schedule timer settings to the Secondary Hub over socket.
+     */
+    suspend fun syncDeviceConfigToHub(
+        token: PairingToken,
+        targetDeviceId: String,
+        bandwidthLimitKbps: Int,
+        scheduleHour: Int,
+        scheduleMinute: Int,
+        configTimestamp: Long = System.currentTimeMillis()
+    ): Boolean = withContext(Dispatchers.IO) {
+        val candidates = listOf(token.localIp, token.tailscaleOrWanHost).filter { it.isNotBlank() && it != "0.0.0.0" }
+        for (host in candidates) {
+            try {
+                Socket().use { socket ->
+                    socket.soTimeout = 3000
+                    socket.connect(InetSocketAddress(host, token.port), 3000)
+                    val writer = PrintWriter(socket.getOutputStream(), true)
+                    val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
+                    writer.println("UPDATE_DEVICE_CONFIG|$targetDeviceId|$bandwidthLimitKbps|$scheduleHour|$scheduleMinute|$configTimestamp")
+                    val resp = reader.readLine()
+                    if (resp == "CONFIG_UPDATED") {
+                        return@withContext true
+                    }
+                }
+            } catch (e: Exception) {
+                // Try next route
+            }
+        }
+        false
     }
 
     suspend fun logEvent(level: String, tag: String, message: String) {

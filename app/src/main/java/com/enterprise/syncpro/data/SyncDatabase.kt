@@ -62,10 +62,18 @@ data class ConnectedDeviceEntity(
     @ColumnInfo(name = "device_name") val deviceName: String,
     @ColumnInfo(name = "ip_address") val ipAddress: String,
     @ColumnInfo(name = "role") val role: String,
-    @ColumnInfo(name = "scheduled_sync") val scheduledSync: String = "12:00 AM",
+    @ColumnInfo(name = "scheduled_sync") val scheduledSync: String = "02:00 AM",
+    @ColumnInfo(name = "schedule_hour") val scheduleHour: Int = 2,
+    @ColumnInfo(name = "schedule_minute") val scheduleMinute: Int = 0,
     @ColumnInfo(name = "bandwidth_limit_kbps") val bandwidthLimitKbps: Int = 0,
+    @ColumnInfo(name = "throttle_start_hour") val throttleStartHour: Int = 2,
+    @ColumnInfo(name = "throttle_start_minute") val throttleStartMinute: Int = 0,
+    @ColumnInfo(name = "throttle_end_hour") val throttleEndHour: Int = 5,
+    @ColumnInfo(name = "throttle_end_minute") val throttleEndMinute: Int = 0,
     @ColumnInfo(name = "sync_status") val syncStatus: String = "Idle",
     @ColumnInfo(name = "traffic_bytes") val trafficBytes: Long = 0L,
+    @ColumnInfo(name = "config_updated_at") val configUpdatedAt: Long = 0L,
+    @ColumnInfo(name = "last_synced_at") val lastSyncedAt: Long = 0L,
     @ColumnInfo(name = "last_seen") val lastSeen: Long = System.currentTimeMillis()
 )
 
@@ -96,6 +104,9 @@ interface SyncDao {
 
     @Query("SELECT COALESCE(SUM(file_size), 0) FROM local_file_index WHERE is_synced = 1")
     fun observeTotalSyncedBytes(): Flow<Long>
+
+    @Query("SELECT COALESCE(SUM(file_size), 0) FROM local_file_index WHERE is_synced = 1")
+    suspend fun getTotalSyncedBytes(): Long
 
     @Query("SELECT * FROM local_file_index WHERE is_synced = 1 ORDER BY synced_timestamp DESC LIMIT 50")
     fun observeRecentUploadedFiles(): Flow<List<LocalFileIndexEntity>>
@@ -129,11 +140,75 @@ interface SyncDao {
     @Query("SELECT * FROM connected_devices ORDER BY last_seen DESC")
     fun observeConnectedDevices(): Flow<List<ConnectedDeviceEntity>>
 
+    @Query("SELECT * FROM connected_devices ORDER BY last_seen DESC")
+    suspend fun getConnectedDevicesList(): List<ConnectedDeviceEntity>
+
+    @Query("SELECT * FROM connected_devices WHERE deviceId = :deviceId LIMIT 1")
+    suspend fun getConnectedDevice(deviceId: String): ConnectedDeviceEntity?
+
+    @Query("SELECT * FROM connected_devices WHERE ip_address = :ip LIMIT 1")
+    suspend fun getConnectedDeviceByIp(ip: String): ConnectedDeviceEntity?
+
+    @Query("DELETE FROM connected_devices WHERE deviceId != :canonicalId AND ip_address = :ip AND ip_address != '' AND ip_address != 'Wi-Fi LAN' AND ip_address != '0.0.0.0'")
+    suspend fun deleteDuplicatesByIp(canonicalId: String, ip: String)
+
+    @Query("DELETE FROM connected_devices WHERE deviceId != :canonicalId AND device_name = :name AND device_name != '' AND device_name != 'Primary Sender'")
+    suspend fun deleteDuplicatesByName(canonicalId: String, name: String)
+
+    suspend fun deleteDuplicates(canonicalId: String, ip: String, name: String) {
+        if (ip.isNotBlank() && ip != "Wi-Fi LAN" && ip != "0.0.0.0") {
+            deleteDuplicatesByIp(canonicalId, ip)
+        }
+        if (name.isNotBlank() && name != "Primary Sender") {
+            deleteDuplicatesByName(canonicalId, name)
+        }
+    }
+
+    @Query("UPDATE connected_devices SET sync_status = :status, last_seen = :now WHERE deviceId = :deviceId")
+    suspend fun updateDeviceStatus(deviceId: String, status: String, now: Long = System.currentTimeMillis())
+
     @Query("UPDATE connected_devices SET bandwidth_limit_kbps = :bandwidthLimitKbps WHERE deviceId = :deviceId")
     suspend fun updateDeviceBandwidth(deviceId: String, bandwidthLimitKbps: Int)
 
+    @Query("UPDATE connected_devices SET bandwidth_limit_kbps = :bandwidthLimitKbps, schedule_hour = :scheduleHour, schedule_minute = :scheduleMinute, scheduled_sync = :scheduledSync, config_updated_at = :configUpdatedAt, last_seen = :now WHERE deviceId = :deviceId")
+    suspend fun updateDeviceScheduleAndBandwidth(
+        deviceId: String,
+        bandwidthLimitKbps: Int,
+        scheduleHour: Int,
+        scheduleMinute: Int,
+        scheduledSync: String,
+        configUpdatedAt: Long = System.currentTimeMillis(),
+        now: Long = System.currentTimeMillis()
+    )
+
+    @Query("UPDATE connected_devices SET bandwidth_limit_kbps = :bandwidthLimitKbps, schedule_hour = :scheduleHour, schedule_minute = :scheduleMinute, scheduled_sync = :scheduledSync, config_updated_at = :configUpdatedAt, last_seen = :now")
+    suspend fun updateAllDevicesScheduleAndBandwidth(
+        bandwidthLimitKbps: Int,
+        scheduleHour: Int,
+        scheduleMinute: Int,
+        scheduledSync: String,
+        configUpdatedAt: Long = System.currentTimeMillis(),
+        now: Long = System.currentTimeMillis()
+    )
+
+    @Query("UPDATE connected_devices SET bandwidth_limit_kbps = :bandwidthLimitKbps, throttle_start_hour = :startHour, throttle_start_minute = :startMinute, throttle_end_hour = :endHour, throttle_end_minute = :endMinute WHERE deviceId = :deviceId")
+    suspend fun updateDeviceSettings(
+        deviceId: String,
+        bandwidthLimitKbps: Int,
+        startHour: Int,
+        startMinute: Int,
+        endHour: Int,
+        endMinute: Int
+    )
+
     @Query("UPDATE connected_devices SET traffic_bytes = traffic_bytes + :bytesAdded, last_seen = :now, sync_status = :status WHERE deviceId = :deviceId")
     suspend fun recordDeviceTraffic(deviceId: String, bytesAdded: Long, status: String, now: Long = System.currentTimeMillis())
+
+    @Query("UPDATE connected_devices SET traffic_bytes = traffic_bytes + :bytesAdded, last_seen = :now, last_synced_at = :now, sync_status = :status WHERE deviceId = :deviceId")
+    suspend fun recordDeviceTrafficAndSync(deviceId: String, bytesAdded: Long, status: String, now: Long = System.currentTimeMillis())
+
+    @Query("UPDATE connected_devices SET last_synced_at = :now, sync_status = :status, last_seen = :now WHERE deviceId = :deviceId")
+    suspend fun markDeviceSynced(deviceId: String, status: String = "Connected", now: Long = System.currentTimeMillis())
 
     @Query("DELETE FROM connected_devices WHERE deviceId = :deviceId")
     suspend fun removeConnectedDevice(deviceId: String)
@@ -156,7 +231,7 @@ interface SyncDao {
         DiagnosticLogEntity::class,
         ConnectedDeviceEntity::class
     ],
-    version = 2,
+    version = 6,
     exportSchema = false
 )
 abstract class SyncDatabase : RoomDatabase() {
@@ -166,6 +241,20 @@ abstract class SyncDatabase : RoomDatabase() {
         @Volatile
         private var INSTANCE: SyncDatabase? = null
 
+        val MIGRATION_5_6 = object : androidx.room.migration.Migration(5, 6) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                // Version 6 added config_updated_at and last_synced_at to connected_devices
+                // Safe no-op: columns already exist in schema from version 6 creation
+                // If upgrading from exact version 5, add columns that might be missing
+                runCatching {
+                    db.execSQL("ALTER TABLE connected_devices ADD COLUMN config_updated_at INTEGER NOT NULL DEFAULT 0")
+                }
+                runCatching {
+                    db.execSQL("ALTER TABLE connected_devices ADD COLUMN last_synced_at INTEGER NOT NULL DEFAULT 0")
+                }
+            }
+        }
+
         fun getInstance(context: Context): SyncDatabase {
             return INSTANCE ?: synchronized(this) {
                 val instance = Room.databaseBuilder(
@@ -173,7 +262,8 @@ abstract class SyncDatabase : RoomDatabase() {
                     SyncDatabase::class.java,
                     "sync_pro_enterprise.db"
                 )
-                    .fallbackToDestructiveMigration()
+                    .addMigrations(MIGRATION_5_6)
+                    .fallbackToDestructiveMigrationFrom(1, 2, 3, 4)
                     .build()
                 INSTANCE = instance
                 instance

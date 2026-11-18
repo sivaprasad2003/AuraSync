@@ -96,9 +96,21 @@ class AutomatedRelayWorker(
         )
 
         if (tasks.isNotEmpty()) {
-            HubForegroundService.startOrUpdate(applicationContext)
+            HubForegroundService.startOrUpdate(applicationContext, HubForegroundService.ACTION_START_SERVICE)
             relayEngine.setPaused(false)
             relayEngine.enqueueTasks(tasks, isUrgentInstantUpload = false)
+
+            // Keep Worker active while transfers complete, checking progress cooperatively
+            var waitLoops = 0
+            while (waitLoops < 360) { // Up to 30 minutes safe execution window
+                delay(5_000)
+                waitLoops++
+                val telem = relayEngine.telemetry.value
+                if (telem.queuedFileCount == 0 && !telem.isRunning) {
+                    break
+                }
+            }
+            relayEngine.logEvent("INFO", "WorkManager", "Daily automated sync cycle executed successfully.")
         }
 
         Result.success()
@@ -153,13 +165,13 @@ object SyncWorkers {
         return (target.timeInMillis - now.timeInMillis).coerceAtLeast(1_000L)
     }
 
-    fun scheduleDailyAutomatedSync(context: Context) {
+    fun scheduleDailyAutomatedSync(context: Context, forceReenqueue: Boolean = false) {
         val vault = VaultManager.getInstance(context)
         val hour = vault.scheduleHour.value
         val minute = vault.scheduleMinute.value
         val initialDelayMillis = computeInitialDelayMillis(hour, minute)
 
-        val periodicRequest = PeriodicWorkRequestBuilder<AutomatedRelayWorker>(12, TimeUnit.HOURS)
+        val periodicRequest = PeriodicWorkRequestBuilder<AutomatedRelayWorker>(24, TimeUnit.HOURS)
             .setInitialDelay(initialDelayMillis, TimeUnit.MILLISECONDS)
             .setBackoffCriteria(
                 BackoffPolicy.EXPONENTIAL,
@@ -170,7 +182,7 @@ object SyncWorkers {
 
         WorkManager.getInstance(context).enqueueUniquePeriodicWork(
             UNIQUE_DAILY_WORK_NAME,
-            ExistingPeriodicWorkPolicy.CANCEL_AND_REENQUEUE,
+            if (forceReenqueue) ExistingPeriodicWorkPolicy.CANCEL_AND_REENQUEUE else ExistingPeriodicWorkPolicy.UPDATE,
             periodicRequest
         )
     }

@@ -2,7 +2,6 @@ package com.enterprise.syncpro.ui
 
 import android.Manifest
 import android.app.Activity
-import android.app.TimePickerDialog
 import com.enterprise.syncpro.service.SyncNotificationReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -27,6 +26,7 @@ import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedContentTransitionScope
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
@@ -60,6 +60,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -71,6 +72,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
@@ -143,10 +145,13 @@ import androidx.compose.material3.RadioButton
 import androidx.compose.material3.RadioButtonDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TimePicker
+import androidx.compose.material3.rememberTimePickerState
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberDrawerState
@@ -166,6 +171,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -181,6 +188,7 @@ import com.enterprise.syncpro.data.DeviceRole
 import com.enterprise.syncpro.data.HubDeduplicationEntity
 import com.enterprise.syncpro.media.MediaBucketSummary
 import com.enterprise.syncpro.media.QrCodeCameraAnalyzer
+import com.enterprise.syncpro.network.NetworkAndSafetyMonitor
 import com.enterprise.syncpro.network.RelayQueueTask
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -229,12 +237,10 @@ class MainActivity : AppCompatActivity() {
 
         setContent {
             val isDarkMode by viewModel.isDarkMode.collectAsState()
-            val toastMessage by viewModel.uiToastMessage.collectAsState()
 
-            LaunchedEffect(toastMessage) {
-                toastMessage?.let { msg ->
+            LaunchedEffect(Unit) {
+                viewModel.toastFlow.collect { msg ->
                     Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show()
-                    viewModel.clearToastMessage()
                 }
             }
 
@@ -375,7 +381,6 @@ private fun SyncProRootScreen(
                             })
                         }
                         (context as? Activity)?.finishAffinity()
-                        android.os.Process.killProcess(android.os.Process.myPid())
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = CrimsonAlert)
                 ) {
@@ -462,8 +467,8 @@ private fun SyncProRootScreen(
     selectedDeviceForConfig?.let { device ->
         DeviceConfigModal(
             device = device,
-            onUpdateBandwidth = { kbps ->
-                viewModel.updateDeviceBandwidth(device.deviceId, kbps)
+            onSaveConfig = { kbps, sh, sm ->
+                viewModel.updateDeviceSettings(device.deviceId, kbps, sh, sm)
                 selectedDeviceForConfig = null
             },
             onDismiss = { selectedDeviceForConfig = null }
@@ -535,20 +540,11 @@ private fun SyncProRootScreen(
 
                 NavigationDrawerItem(
                     label = {
-                        Column {
-                            Text(
-                                text = "Primary Sender Node",
-                                fontWeight = if (deviceRole == DeviceRole.PRIMARY_SENDER) FontWeight.Bold else FontWeight.Normal,
-                                maxLines = 1
-                            )
-                            Spacer(modifier = Modifier.height(2.dp))
-                            Text(
-                                text = "Uploads encrypted media to Hub",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                maxLines = 1
-                            )
-                        }
+                        Text(
+                            text = "Primary Sender Node",
+                            fontWeight = if (deviceRole == DeviceRole.PRIMARY_SENDER) FontWeight.Bold else FontWeight.Normal,
+                            maxLines = 1
+                        )
                     },
                     selected = deviceRole == DeviceRole.PRIMARY_SENDER,
                     icon = {
@@ -567,20 +563,11 @@ private fun SyncProRootScreen(
 
                 NavigationDrawerItem(
                     label = {
-                        Column {
-                            Text(
-                                text = "Secondary Google Hub",
-                                fontWeight = if (deviceRole == DeviceRole.SECONDARY_HUB) FontWeight.Bold else FontWeight.Normal,
-                                maxLines = 1
-                            )
-                            Spacer(modifier = Modifier.height(2.dp))
-                            Text(
-                                text = "Receives & commits to Google Photos",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                maxLines = 1
-                            )
-                        }
+                        Text(
+                            text = "Secondary Google Hub",
+                            fontWeight = if (deviceRole == DeviceRole.SECONDARY_HUB) FontWeight.Bold else FontWeight.Normal,
+                            maxLines = 1
+                        )
                     },
                     selected = deviceRole == DeviceRole.SECONDARY_HUB,
                     icon = {
@@ -609,19 +596,10 @@ private fun SyncProRootScreen(
 
                 NavigationDrawerItem(
                     label = {
-                        Column {
-                            Text("Hardware Safety & Doze Settings", maxLines = 1)
-                            Spacer(modifier = Modifier.height(2.dp))
-                            Text(
-                                "Thermal, battery & doze cutoffs",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                maxLines = 1
-                            )
-                        }
+                        Text("Hardware Safety & Doze Settings", maxLines = 1)
                     },
                     selected = false,
-                    icon = { Icon(Icons.Default.Security, contentDescription = null, tint = EmeraldNeon) },
+                    icon = { Icon(Icons.Default.Security, contentDescription = null) },
                     onClick = {
                         showSafetySettingsModal = true
                         scope.launch { drawerState.close() }
@@ -666,7 +644,17 @@ private fun SyncProRootScreen(
                     selected = false,
                     icon = { Icon(Icons.Default.Code, contentDescription = null) },
                     onClick = {
-                        openExternalUrl(context, "https://github.com/sivaprasad2003/SyncPro")
+                        openExternalUrl(context, "https://github.com/sivaprasad2003/AuraSync")
+                        scope.launch { drawerState.close() }
+                    }
+                )
+
+                NavigationDrawerItem(
+                    label = { Text("Telegram Community") },
+                    selected = false,
+                    icon = { Icon(Icons.AutoMirrored.Filled.Send, contentDescription = null) },
+                    onClick = {
+                        openExternalUrl(context, "https://t.me/aurasyncapp")
                         scope.launch { drawerState.close() }
                     }
                 )
@@ -746,7 +734,6 @@ private fun SyncProRootScreen(
                         IconButton(
                             onClick = {
                                 viewModel.refreshAllState()
-                                Toast.makeText(context, "Refreshed", Toast.LENGTH_SHORT).show()
                             },
                             enabled = !isRefreshing
                         ) {
@@ -759,20 +746,19 @@ private fun SyncProRootScreen(
                                 tint = if (isRefreshing) EmeraldNeon else MaterialTheme.colorScheme.onSurface
                             )
                         }
-                        val isDark by viewModel.isDarkMode.collectAsState()
                         val themeRotation by animateFloatAsState(
-                            targetValue = if (isDark) 360f else 0f,
+                            targetValue = if (isDarkMode) 360f else 0f,
                             animationSpec = tween(durationMillis = 350, easing = LinearEasing),
                             label = "ThemeToggleRotation"
                         )
                         IconButton(onClick = {
-                            viewModel.toggleDarkMode(!isDark)
-                            Toast.makeText(context, if (!isDark) "Dark mode" else "Light mode", Toast.LENGTH_SHORT).show()
+                            viewModel.toggleDarkMode(!isDarkMode)
+                            Toast.makeText(context, if (!isDarkMode) "Dark mode" else "Light mode", Toast.LENGTH_SHORT).show()
                         }) {
                             Icon(
-                                imageVector = if (isDark) Icons.Default.DarkMode else Icons.Default.LightMode,
+                                imageVector = if (isDarkMode) Icons.Default.DarkMode else Icons.Default.LightMode,
                                 contentDescription = "Toggle Dark/Light Mode",
-                                tint = if (isDark) EmeraldNeon else Color(0xFFF59E0B),
+                                tint = if (isDarkMode) EmeraldNeon else Color(0xFFF59E0B),
                                 modifier = Modifier.graphicsLayer { rotationZ = themeRotation }
                             )
                         }
@@ -825,7 +811,13 @@ private fun SyncProRootScreen(
                 AnimatedContent(
                     targetState = selectedTab,
                     transitionSpec = {
-                        fadeIn(animationSpec = tween(200)) togetherWith fadeOut(animationSpec = tween(200))
+                        val direction = if (targetState.ordinal > initialState.ordinal) {
+                            AnimatedContentTransitionScope.SlideDirection.Left
+                        } else {
+                            AnimatedContentTransitionScope.SlideDirection.Right
+                        }
+                        (slideIntoContainer(direction, animationSpec = tween(220)) + fadeIn(animationSpec = tween(200)))
+                            .togetherWith(slideOutOfContainer(direction, animationSpec = tween(220)) + fadeOut(animationSpec = tween(180)))
                     },
                     label = "TabTransition"
                 ) { targetTab ->
@@ -855,6 +847,48 @@ private fun SyncProRootScreen(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SyncProTimePickerDialog(
+    title: String = "Select Time",
+    initialHour: Int,
+    initialMinute: Int,
+    is24Hour: Boolean = false,
+    onConfirm: (hour: Int, minute: Int) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val timePickerState = rememberTimePickerState(
+        initialHour = initialHour.coerceIn(0, 23),
+        initialMinute = initialMinute.coerceIn(0, 59),
+        is24Hour = is24Hour
+    )
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = {
+            TextButton(onClick = {
+                onConfirm(timePickerState.hour, timePickerState.minute)
+                onDismiss()
+            }) {
+                Text("OK", color = EmeraldNeon, fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        },
+        title = {
+            Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+        },
+        text = {
+            Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                TimePicker(state = timePickerState)
+            }
+        },
+        shape = RoundedCornerShape(20.dp)
+    )
+}
+
 @Composable
 private fun DashboardScreen(
     viewModel: MainViewModel,
@@ -863,12 +897,18 @@ private fun DashboardScreen(
     onConfigureDevice: (ConnectedDeviceEntity) -> Unit
 ) {
     val context = LocalContext.current
+    val haptic = LocalHapticFeedback.current
     val role by viewModel.deviceRole.collectAsState()
     val telemetry by viewModel.telemetry.collectAsState()
     val safety by viewModel.safetyStatus.collectAsState()
     val scheduleHour by viewModel.scheduleHour.collectAsState()
     val scheduleMinute by viewModel.scheduleMinute.collectAsState()
     val daytimeKbps by viewModel.daytimeLimitKbps.collectAsState()
+    val throttleStartHour by viewModel.throttleStartHour.collectAsState()
+    val throttleStartMinute by viewModel.throttleStartMinute.collectAsState()
+    val throttleEndHour by viewModel.throttleEndHour.collectAsState()
+    val throttleEndMinute by viewModel.throttleEndMinute.collectAsState()
+    val pairingToken by viewModel.pairingToken.collectAsState()
     val priorityWeight by viewModel.devicePriorityWeight.collectAsState()
     val instantCapture by viewModel.instantCaptureSync.collectAsState()
     val syncedLocalCount by viewModel.syncedLocalCount.collectAsState()
@@ -879,6 +919,56 @@ private fun DashboardScreen(
     val recentUploadedFiles by viewModel.recentUploadedFiles.collectAsState()
     val connectedDevices by viewModel.connectedDevices.collectAsState()
     val uploadQueue by viewModel.uploadQueue.collectAsState()
+    val storageCutoffGb by viewModel.storageCutoffGb.collectAsState()
+
+    var showStorageSafetyModal by rememberSaveable { mutableStateOf(false) }
+    var showHubVaultDetailsModal by rememberSaveable { mutableStateOf(false) }
+
+    if (showStorageSafetyModal) {
+        StorageSafetyModal(
+            viewModel = viewModel,
+            onDismiss = { showStorageSafetyModal = false }
+        )
+    }
+
+    if (showHubVaultDetailsModal) {
+        HubVaultDetailsModal(
+            viewModel = viewModel,
+            onDismiss = { showHubVaultDetailsModal = false }
+        )
+    }
+
+    var showScheduleTimePicker by rememberSaveable { mutableStateOf(false) }
+    var showThrottleStartTimePicker by rememberSaveable { mutableStateOf(false) }
+    var showThrottleEndTimePicker by rememberSaveable { mutableStateOf(false) }
+
+    if (showScheduleTimePicker) {
+        SyncProTimePickerDialog(
+            title = "Set Daily Sync Schedule",
+            initialHour = scheduleHour,
+            initialMinute = scheduleMinute,
+            onConfirm = { h, m -> viewModel.updateDailySchedule(h, m) },
+            onDismiss = { showScheduleTimePicker = false }
+        )
+    }
+    if (showThrottleStartTimePicker) {
+        SyncProTimePickerDialog(
+            title = "Set Throttle Window Start",
+            initialHour = throttleStartHour,
+            initialMinute = throttleStartMinute,
+            onConfirm = { h, m -> viewModel.updateBandwidthThrottleWindow(h, m, throttleEndHour, throttleEndMinute) },
+            onDismiss = { showThrottleStartTimePicker = false }
+        )
+    }
+    if (showThrottleEndTimePicker) {
+        SyncProTimePickerDialog(
+            title = "Set Throttle Window End",
+            initialHour = throttleEndHour,
+            initialMinute = throttleEndMinute,
+            onConfirm = { h, m -> viewModel.updateBandwidthThrottleWindow(throttleStartHour, throttleStartMinute, h, m) },
+            onDismiss = { showThrottleEndTimePicker = false }
+        )
+    }
 
     val isDark by viewModel.isDarkMode.collectAsState()
 
@@ -890,6 +980,8 @@ private fun DashboardScreen(
     } else {
         0f
     }
+
+    val isSyncActive = telemetry.isRunning || telemetry.queuedFileCount > 0
 
     val animatedProgress by animateFloatAsState(
         targetValue = if (telemetry.isRunning || telemetry.queuedFileCount > 0) overallProgress else if (completedBatchFiles > 0 && telemetry.queuedFileCount == 0) 1f else 0f,
@@ -1031,174 +1123,193 @@ private fun DashboardScreen(
                                     .height(4.dp)
                                     .clip(RoundedCornerShape(2.dp)),
                                 color = EmeraldNeon,
-                                trackColor = EmeraldNeon.copy(alpha = 0.2f)
+                                trackColor = EmeraldNeon.copy(alpha = 0.2f),
+                                strokeCap = androidx.compose.ui.graphics.StrokeCap.Round
                             )
+                            if (telemetry.isRunning || isSyncActive || telemetry.isHubBusyWithSync) {
+                                val currentPeerText = if (role == DeviceRole.SECONDARY_HUB) {
+                                    val sender = if (telemetry.sourceDeviceName.isNotBlank()) telemetry.sourceDeviceName else "Primary Sender Node"
+                                    "Receiving from: $sender"
+                                } else {
+                                    val hubName = pairingToken?.hubDeviceName?.ifBlank { "Secondary Hub" } ?: "Secondary Hub"
+                                    "Syncing to: $hubName"
+                                }
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Text(
+                                    text = currentPeerText,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = EmeraldNeon,
+                                    fontWeight = FontWeight.SemiBold,
+                                    modifier = Modifier.fillMaxWidth(),
+                                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                                )
+                            }
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(16.dp))
+                    if (role != DeviceRole.SECONDARY_HUB) {
+                        Spacer(modifier = Modifier.height(16.dp))
 
-                    // Intelligent State-Driven Animated Action Controls (Idle: Sync Now | Active: Pause & Stop | Paused: Resume & Stop)
-                    val isSyncActive = telemetry.isRunning || telemetry.queuedFileCount > 0
-                    val isSyncPaused = telemetry.isPaused
+                        // Intelligent State-Driven Animated Action Controls (Idle: Sync Now | Active: Pause & Stop | Paused: Resume & Stop)
+                        val isSyncPaused = telemetry.isPaused
 
-                    AnimatedContent(
-                        targetState = when {
-                            isSyncPaused -> "PAUSED"
-                            isSyncActive -> "ACTIVE"
-                            else -> "IDLE"
-                        },
-                        transitionSpec = {
-                            (fadeIn(animationSpec = tween(220)) + expandVertically()) togetherWith
-                                    (fadeOut(animationSpec = tween(180)) + shrinkVertically())
-                        },
-                        label = "SyncActionButtonsTransition",
-                        modifier = Modifier.fillMaxWidth()
-                    ) { syncState ->
-                        when (syncState) {
-                            "ACTIVE" -> {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                                ) {
-                                    FilledTonalButton(
-                                        onClick = {
-                                            viewModel.togglePauseResume()
-                                            Toast.makeText(context, "Sync paused", Toast.LENGTH_SHORT).show()
-                                        },
-                                        modifier = Modifier
-                                            .weight(1f)
-                                            .height(46.dp),
-                                        shape = RoundedCornerShape(12.dp),
-                                        colors = ButtonDefaults.filledTonalButtonColors(
-                                            containerColor = if (isDark) Color(0xFF2C2517) else Color(0xFFFEF3C7),
-                                            contentColor = if (isDark) Color(0xFFFBBF24) else Color(0xFFB45309)
-                                        )
+                        AnimatedContent(
+                            targetState = when {
+                                isSyncPaused -> "PAUSED"
+                                isSyncActive -> "ACTIVE"
+                                else -> "IDLE"
+                            },
+                            transitionSpec = {
+                                (fadeIn(animationSpec = tween(220)) + expandVertically()) togetherWith
+                                        (fadeOut(animationSpec = tween(180)) + shrinkVertically())
+                            },
+                            label = "SyncActionButtonsTransition",
+                            modifier = Modifier.fillMaxWidth()
+                        ) { syncState ->
+                            when (syncState) {
+                                "ACTIVE" -> {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(10.dp)
                                     ) {
-                                        Icon(
-                                            imageVector = Icons.Default.Pause,
-                                            contentDescription = null,
-                                            modifier = Modifier.size(18.dp)
-                                        )
-                                        Spacer(modifier = Modifier.width(6.dp))
-                                        Text(
-                                            text = "Pause",
-                                            fontWeight = FontWeight.Bold,
-                                            style = MaterialTheme.typography.labelLarge
-                                        )
-                                    }
+                                        FilledTonalButton(
+                                            onClick = {
+                                                viewModel.togglePauseResume()
+                                            },
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .height(46.dp),
+                                            shape = RoundedCornerShape(12.dp),
+                                            colors = ButtonDefaults.filledTonalButtonColors(
+                                                containerColor = if (isDark) Color(0xFF2C2517) else Color(0xFFFEF3C7),
+                                                contentColor = if (isDark) Color(0xFFFBBF24) else Color(0xFFB45309)
+                                            )
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Pause,
+                                                contentDescription = null,
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Text(
+                                                text = "Pause",
+                                                fontWeight = FontWeight.Bold,
+                                                style = MaterialTheme.typography.labelLarge
+                                            )
+                                        }
 
-                                    Button(
-                                        onClick = {
-                                            viewModel.stopSync()
-                                            Toast.makeText(context, "Sync stopped", Toast.LENGTH_SHORT).show()
-                                        },
-                                        modifier = Modifier
-                                            .weight(1f)
-                                            .height(46.dp),
-                                        shape = RoundedCornerShape(12.dp),
-                                        colors = ButtonDefaults.buttonColors(containerColor = CrimsonAlert)
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.Default.Stop,
-                                            contentDescription = null,
-                                            tint = Color.White,
-                                            modifier = Modifier.size(18.dp)
-                                        )
-                                        Spacer(modifier = Modifier.width(6.dp))
-                                        Text(
-                                            text = "Stop",
-                                            color = Color.White,
-                                            fontWeight = FontWeight.Bold,
-                                            style = MaterialTheme.typography.labelLarge
-                                        )
+                                        Button(
+                                            onClick = {
+                                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                viewModel.stopSync()
+                                            },
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .height(46.dp),
+                                            shape = RoundedCornerShape(12.dp),
+                                            colors = ButtonDefaults.buttonColors(containerColor = CrimsonAlert)
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Stop,
+                                                contentDescription = null,
+                                                tint = Color.White,
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Text(
+                                                text = "Stop",
+                                                color = Color.White,
+                                                fontWeight = FontWeight.Bold,
+                                                style = MaterialTheme.typography.labelLarge
+                                            )
+                                        }
                                     }
                                 }
-                            }
-                            "PAUSED" -> {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                                ) {
+                                "PAUSED" -> {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                    ) {
+                                        Button(
+                                            onClick = {
+                                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                viewModel.togglePauseResume()
+                                            },
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .height(46.dp),
+                                            shape = RoundedCornerShape(12.dp),
+                                            colors = ButtonDefaults.buttonColors(containerColor = EmeraldNeon)
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.PlayArrow,
+                                                contentDescription = null,
+                                                tint = Color.Black,
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Text(
+                                                text = "Resume",
+                                                color = Color.Black,
+                                                fontWeight = FontWeight.Bold,
+                                                style = MaterialTheme.typography.labelLarge
+                                            )
+                                        }
+
+                                        OutlinedButton(
+                                            onClick = {
+                                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                viewModel.stopSync()
+                                            },
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .height(46.dp),
+                                            shape = RoundedCornerShape(12.dp),
+                                            colors = ButtonDefaults.outlinedButtonColors(contentColor = CrimsonAlert),
+                                            border = BorderStroke(1.dp, CrimsonAlert.copy(alpha = 0.8f))
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Stop,
+                                                contentDescription = null,
+                                                tint = CrimsonAlert,
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Text(
+                                                text = "Stop",
+                                                color = CrimsonAlert,
+                                                fontWeight = FontWeight.Bold,
+                                                style = MaterialTheme.typography.labelLarge
+                                            )
+                                        }
+                                    }
+                                }
+                                else -> { // "IDLE"
                                     Button(
                                         onClick = {
-                                            viewModel.togglePauseResume()
-                                            Toast.makeText(context, "Sync resumed", Toast.LENGTH_SHORT).show()
+                                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                            viewModel.startFullBatchSyncNow()
                                         },
                                         modifier = Modifier
-                                            .weight(1f)
+                                            .fillMaxWidth()
                                             .height(46.dp),
                                         shape = RoundedCornerShape(12.dp),
                                         colors = ButtonDefaults.buttonColors(containerColor = EmeraldNeon)
                                     ) {
                                         Icon(
-                                            imageVector = Icons.Default.PlayArrow,
+                                            imageVector = Icons.Default.Sync,
                                             contentDescription = null,
                                             tint = Color.Black,
                                             modifier = Modifier.size(18.dp)
                                         )
-                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Spacer(modifier = Modifier.width(8.dp))
                                         Text(
-                                            text = "Resume",
+                                            text = "Sync Now",
                                             color = Color.Black,
                                             fontWeight = FontWeight.Bold,
                                             style = MaterialTheme.typography.labelLarge
                                         )
                                     }
-
-                                    OutlinedButton(
-                                        onClick = {
-                                            viewModel.stopSync()
-                                            Toast.makeText(context, "Sync stopped", Toast.LENGTH_SHORT).show()
-                                        },
-                                        modifier = Modifier
-                                            .weight(1f)
-                                            .height(46.dp),
-                                        shape = RoundedCornerShape(12.dp),
-                                        colors = ButtonDefaults.outlinedButtonColors(contentColor = CrimsonAlert),
-                                        border = BorderStroke(1.dp, CrimsonAlert.copy(alpha = 0.8f))
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.Default.Stop,
-                                            contentDescription = null,
-                                            tint = CrimsonAlert,
-                                            modifier = Modifier.size(18.dp)
-                                        )
-                                        Spacer(modifier = Modifier.width(6.dp))
-                                        Text(
-                                            text = "Stop",
-                                            color = CrimsonAlert,
-                                            fontWeight = FontWeight.Bold,
-                                            style = MaterialTheme.typography.labelLarge
-                                        )
-                                    }
-                                }
-                            }
-                            else -> { // "IDLE"
-                                Button(
-                                    onClick = {
-                                        viewModel.startFullBatchSyncNow()
-                                        Toast.makeText(context, "Sync started", Toast.LENGTH_SHORT).show()
-                                    },
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .height(46.dp),
-                                    shape = RoundedCornerShape(12.dp),
-                                    colors = ButtonDefaults.buttonColors(containerColor = EmeraldNeon)
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Sync,
-                                        contentDescription = null,
-                                        tint = Color.Black,
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Text(
-                                        text = "Sync Now",
-                                        color = Color.Black,
-                                        fontWeight = FontWeight.Bold,
-                                        style = MaterialTheme.typography.labelLarge
-                                    )
                                 }
                             }
                         }
@@ -1218,7 +1329,8 @@ private fun DashboardScreen(
                 Card(
                     modifier = Modifier
                         .weight(1f)
-                        .fillMaxHeight(),
+                        .fillMaxHeight()
+                        .clickable { showHubVaultDetailsModal = true },
                     shape = RoundedCornerShape(18.dp),
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
                     border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
@@ -1282,7 +1394,8 @@ private fun DashboardScreen(
                 Card(
                     modifier = Modifier
                         .weight(1f)
-                        .fillMaxHeight(),
+                        .fillMaxHeight()
+                        .clickable { showStorageSafetyModal = true },
                     shape = RoundedCornerShape(18.dp),
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
                     border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
@@ -1316,7 +1429,7 @@ private fun DashboardScreen(
                             )
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
-                                text = if (safety.isLowStorageTripped) "< 1GB guard tripped" else "> 1GB guard active",
+                                text = if (safety.isLowStorageTripped) "< ${String.format(Locale.US, "%.1f", storageCutoffGb)}GB guard tripped" else "> ${String.format(Locale.US, "%.1f", storageCutoffGb)}GB guard active",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = if (safety.isLowStorageTripped) CrimsonAlert else MaterialTheme.colorScheme.onSurfaceVariant,
                                 maxLines = 1,
@@ -1328,171 +1441,226 @@ private fun DashboardScreen(
             }
         }
 
-        // Automation, 12-Hour TimePickerDialog Scheduler & Bandwidth Throttling
-        item {
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(18.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "Daily Automated Sync Schedule",
-                                style = MaterialTheme.typography.titleMedium
-                            )
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Text(
-                                text = "Scheduled at ${viewModel.format12HourTime(scheduleHour, scheduleMinute)} (Every 12h, Uncapped 02:00-06:00 AM)",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.primary
-                            )
-                        }
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Button(
-                            onClick = {
-                                TimePickerDialog(
-                                    context,
-                                    { _, selectedHour, selectedMinute ->
-                                        viewModel.updateDailySchedule(selectedHour, selectedMinute)
-                                        Toast.makeText(
-                                            context,
-                                            "Schedule set to ${viewModel.format12HourTime(selectedHour, selectedMinute)}",
-                                            Toast.LENGTH_SHORT
-                                        ).show()
-                                    },
-                                    scheduleHour,
-                                    scheduleMinute,
-                                    false // 12-hour AM/PM picker
-                                ).show()
-                            },
-                            modifier = Modifier.height(40.dp),
-                            shape = RoundedCornerShape(10.dp)
+        // Automation, 12-Hour TimePickerDialog Scheduler & Bandwidth Throttling (Hidden on Secondary Hub)
+        if (role != DeviceRole.SECONDARY_HUB) {
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(18.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Icon(Icons.Default.Schedule, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(viewModel.format12HourTime(scheduleHour, scheduleMinute))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Daily Automated Sync Schedule",
+                                    style = MaterialTheme.typography.titleMedium
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = "Daily automated sync at ${viewModel.format12HourTime(scheduleHour, scheduleMinute)}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Button(
+                                onClick = {
+                                    showScheduleTimePicker = true
+                                },
+                                modifier = Modifier.height(40.dp),
+                                shape = RoundedCornerShape(10.dp)
+                            ) {
+                                Icon(Icons.Default.Schedule, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(viewModel.format12HourTime(scheduleHour, scheduleMinute))
+                            }
                         }
-                    }
 
-                    HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp), color = MaterialTheme.colorScheme.outlineVariant)
+                        HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp), color = MaterialTheme.colorScheme.outlineVariant)
 
-                    // Daytime Bandwidth Throttle Slider (Discrete Presets: 1MB/s, 2.5MB/s, 5MB/s, 10MB/s, 20MB/s, Unlimited)
-                    val bandwidthOptions = remember { listOf(1024, 2560, 5120, 10240, 20480, 0) }
-                    val currentSliderIndex = remember(daytimeKbps) {
-                        val idx = bandwidthOptions.indexOf(daytimeKbps)
-                        if (idx >= 0) idx.toFloat() else (bandwidthOptions.size - 1).toFloat()
-                    }
+                        // Daytime Bandwidth Throttle Slider (Discrete Presets: 1MB/s, 2.5MB/s, 5MB/s, 10MB/s, 20MB/s, Unlimited)
+                        val bandwidthOptions = remember { listOf(1024, 2560, 5120, 10240, 20480, 0) }
+                        val currentSliderIndex = remember(daytimeKbps) {
+                            val idx = bandwidthOptions.indexOf(daytimeKbps)
+                            if (idx >= 0) idx.toFloat() else (bandwidthOptions.size - 1).toFloat()
+                        }
 
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text("Daytime Bandwidth Throttle", style = MaterialTheme.typography.bodyMedium)
-                        Text(
-                            text = if (daytimeKbps <= 0) "Unlimited (Max)" else "${String.format(Locale.US, "%.1f", daytimeKbps / 1024f)} MB/s (${daytimeKbps} KB/s)",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = EmeraldNeon
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text("Daytime Bandwidth Throttle", style = MaterialTheme.typography.bodyMedium)
+                            Text(
+                                text = if (daytimeKbps <= 0) "Unlimited (Max)" else "${String.format(Locale.US, "%.1f", daytimeKbps / 1024f)} MB/s (${daytimeKbps} KB/s)",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = EmeraldNeon
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Slider(
+                            value = currentSliderIndex,
+                            onValueChange = { pos ->
+                                val chosen = bandwidthOptions[pos.roundToInt().coerceIn(0, bandwidthOptions.size - 1)]
+                                viewModel.updateDaytimeBandwidthLimit(chosen)
+                            },
+                            valueRange = 0f..(bandwidthOptions.size - 1).toFloat(),
+                            steps = bandwidthOptions.size - 2
                         )
-                    }
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Slider(
-                        value = currentSliderIndex,
-                        onValueChange = { pos ->
-                            val chosen = bandwidthOptions[pos.roundToInt().coerceIn(0, bandwidthOptions.size - 1)]
-                            viewModel.updateDaytimeBandwidthLimit(chosen)
-                            val text = if (chosen <= 0) "Bandwidth: Unlimited" else "Bandwidth: ${chosen / 1024f} MB/s"
-                            Toast.makeText(context, text, Toast.LENGTH_SHORT).show()
-                        },
-                        valueRange = 0f..(bandwidthOptions.size - 1).toFloat(),
-                        steps = bandwidthOptions.size - 2
-                    )
 
-                    HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp), color = MaterialTheme.colorScheme.outlineVariant)
-
-                    // Priority Weight Selector (1..5)
-                    Column(
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
+                        Spacer(modifier = Modifier.height(10.dp))
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                text = "Device PriorityQueue Weight",
-                                style = MaterialTheme.typography.bodyMedium
+                                text = "Throttle Active Window (Timer)",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold
                             )
                             Text(
-                                text = "Weight: $priorityWeight",
+                                text = "${viewModel.format12HourTime(throttleStartHour, throttleStartMinute)} - ${viewModel.format12HourTime(throttleEndHour, throttleEndMinute)}",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = EmeraldNeon
+                                color = EmeraldNeon,
+                                fontWeight = FontWeight.Bold
                             )
                         }
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = if (daytimeKbps <= 0) "Transfers run uncapped at maximum speed."
+                            else "Transfers throttled to ${String.format(Locale.US, "%.1f", daytimeKbps / 1024f)} MB/s during this window. Full speed outside.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                         Spacer(modifier = Modifier.height(8.dp))
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            (1..5).forEach { weight ->
-                                val isSelected = priorityWeight == weight
-                                Surface(
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .height(40.dp)
-                                        .clickable {
-                                            viewModel.updateDevicePriorityWeight(weight)
-                                            Toast.makeText(context, "Priority $weight", Toast.LENGTH_SHORT).show()
-                                        },
-                                    shape = RoundedCornerShape(10.dp),
-                                    color = if (isSelected) EmeraldNeon else MaterialTheme.colorScheme.surfaceVariant,
-                                    border = BorderStroke(
-                                        width = if (isSelected) 1.5.dp else 1.dp,
-                                        color = if (isSelected) EmeraldNeon else MaterialTheme.colorScheme.outlineVariant
-                                    )
-                                ) {
-                                    Box(contentAlignment = Alignment.Center) {
-                                        Text(
-                                            text = if (weight == 5) "5 (Max)" else "$weight",
-                                            style = MaterialTheme.typography.labelMedium,
-                                            fontWeight = if (isSelected) FontWeight.ExtraBold else FontWeight.Medium,
-                                            color = if (isSelected) Color.Black else MaterialTheme.colorScheme.onSurface
+                            OutlinedButton(
+                                onClick = {
+                                    showThrottleStartTimePicker = true
+                                },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(40.dp),
+                                shape = RoundedCornerShape(10.dp),
+                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                            ) {
+                                Icon(Icons.Default.Schedule, contentDescription = null, modifier = Modifier.size(15.dp), tint = EmeraldNeon)
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "From: ${viewModel.format12HourTime(throttleStartHour, throttleStartMinute)}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    maxLines = 1
+                                )
+                            }
+
+                            OutlinedButton(
+                                onClick = {
+                                    showThrottleEndTimePicker = true
+                                },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(40.dp),
+                                shape = RoundedCornerShape(10.dp),
+                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                            ) {
+                                Icon(Icons.Default.Schedule, contentDescription = null, modifier = Modifier.size(15.dp), tint = EmeraldNeon)
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "To: ${viewModel.format12HourTime(throttleEndHour, throttleEndMinute)}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    maxLines = 1
+                                )
+                            }
+                        }
+
+                        HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp), color = MaterialTheme.colorScheme.outlineVariant)
+
+                        // Priority Weight Selector (1..5)
+                        Column(
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Device PriorityQueue Weight",
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
+                                Text(
+                                    text = "Weight: $priorityWeight",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = EmeraldNeon
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                (1..5).forEach { weight ->
+                                    val isSelected = priorityWeight == weight
+                                    Surface(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .height(40.dp)
+                                            .clickable {
+                                                viewModel.updateDevicePriorityWeight(weight)
+                                            },
+                                        shape = RoundedCornerShape(10.dp),
+                                        color = if (isSelected) EmeraldNeon else MaterialTheme.colorScheme.surfaceVariant,
+                                        border = BorderStroke(
+                                            width = if (isSelected) 1.5.dp else 1.dp,
+                                            color = if (isSelected) EmeraldNeon else MaterialTheme.colorScheme.outlineVariant
                                         )
+                                    ) {
+                                        Box(contentAlignment = Alignment.Center) {
+                                            Text(
+                                                text = if (weight == 5) "5 (Max)" else "$weight",
+                                                style = MaterialTheme.typography.labelMedium,
+                                                fontWeight = if (isSelected) FontWeight.ExtraBold else FontWeight.Medium,
+                                                color = if (isSelected) Color.Black else MaterialTheme.colorScheme.onSurface
+                                            )
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
 
-                    HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp), color = MaterialTheme.colorScheme.outlineVariant)
+                        HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp), color = MaterialTheme.colorScheme.outlineVariant)
 
-                    // Instant Capture MediaStore Trigger Toggle
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("Instant Camera Capture Trigger", style = MaterialTheme.typography.bodyMedium)
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Text(
-                                text = "Instantly relays new camera photos to hub",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                        // Instant Capture MediaStore Trigger Toggle
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Instant Camera Capture Trigger", style = MaterialTheme.typography.bodyMedium)
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = "Instantly relays new camera photos to hub",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(16.dp))
+                            Switch(
+                                checked = instantCapture,
+                                onCheckedChange = { viewModel.toggleInstantCapture(it) },
+                                colors = syncProSwitchColors()
                             )
                         }
-                        Spacer(modifier = Modifier.width(16.dp))
-                        Switch(
-                            checked = instantCapture,
-                            onCheckedChange = { viewModel.toggleInstantCapture(it) },
-                            colors = syncProSwitchColors()
-                        )
                     }
                 }
             }
@@ -1507,38 +1675,76 @@ private fun DashboardScreen(
                 border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
+                    val myDeviceId by viewModel.myDeviceId.collectAsState()
+                    val myFriendlyName = viewModel.myFriendlyName
+                    val displayDevices = remember(connectedDevices, role, myDeviceId, myFriendlyName) {
+                        val filtered = if (role == DeviceRole.PRIMARY_SENDER) {
+                            connectedDevices.filterNot { dev ->
+                                (myDeviceId.isNotEmpty() && dev.deviceId == myDeviceId) ||
+                                dev.deviceName.equals(myFriendlyName, ignoreCase = true) ||
+                                dev.deviceName.equals(android.os.Build.MODEL, ignoreCase = true) ||
+                                (dev.role == "PRIMARY_SENDER" && (dev.deviceName.contains(android.os.Build.MODEL, ignoreCase = true) || dev.deviceId.contains(android.os.Build.MODEL, ignoreCase = true)))
+                            }
+                        } else {
+                            connectedDevices
+                        }
+                        filtered.groupBy { dev ->
+                            if (dev.ipAddress.isNotBlank() && dev.ipAddress != "Wi-Fi LAN" && dev.ipAddress != "0.0.0.0") {
+                                dev.ipAddress
+                            } else {
+                                dev.deviceId
+                            }
+                        }.values.map { list ->
+                            list.firstOrNull { it.syncStatus.startsWith("Receiving", ignoreCase = true) || it.syncStatus.startsWith("Sending", ignoreCase = true) }
+                                ?: list.maxByOrNull { it.lastSeen } ?: list.first()
+                        }
+                    }
+
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
                             Icon(
                                 imageVector = Icons.Default.Devices,
                                 contentDescription = null,
                                 tint = EmeraldNeon,
                                 modifier = Modifier.size(20.dp)
                             )
-                            Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = "Connected Devices (${connectedDevices.size})",
-                                style = MaterialTheme.typography.titleMedium
+                                text = "Connected Devices",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold
                             )
                         }
-                        Text(
-                            text = if (role == DeviceRole.SECONDARY_HUB) "Hub Mesh" else "Node Mesh",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.primary
-                        )
+                        Surface(
+                            color = EmeraldNeon.copy(alpha = 0.15f),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text(
+                                text = "${displayDevices.size} ${if (displayDevices.size == 1) "Client" else "Clients"}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = EmeraldNeon,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
+                        }
                     }
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "Real-time sync schedule, bandwidth allocation & data traffic",
+                        text = if (role == DeviceRole.SECONDARY_HUB)
+                            "Real-time connected primary senders, schedules & data traffic"
+                        else
+                            "Hub mesh connection, peer devices & allocated bandwidth",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
 
-                    if (connectedDevices.isEmpty()) {
+                    if (displayDevices.isEmpty()) {
                         Spacer(modifier = Modifier.height(10.dp))
                         Surface(
                             color = MaterialTheme.colorScheme.surface.copy(alpha = 0.5f),
@@ -1546,7 +1752,7 @@ private fun DashboardScreen(
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             Column(
-                                modifier = Modifier.padding(12.dp),
+                                modifier = Modifier.padding(14.dp),
                                 horizontalAlignment = Alignment.CenterHorizontally
                             ) {
                                 Icon(
@@ -1555,12 +1761,13 @@ private fun DashboardScreen(
                                     tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
                                     modifier = Modifier.size(28.dp)
                                 )
-                                Spacer(modifier = Modifier.height(4.dp))
+                                Spacer(modifier = Modifier.height(6.dp))
                                 Text(
-                                    text = "No Peer Devices Connected Yet",
+                                    text = if (role == DeviceRole.SECONDARY_HUB) "No Peer Devices Connected Yet" else "Searching for Hub Peers...",
                                     style = MaterialTheme.typography.labelMedium,
                                     fontWeight = FontWeight.SemiBold
                                 )
+                                Spacer(modifier = Modifier.height(2.dp))
                                 Text(
                                     text = if (role == DeviceRole.SECONDARY_HUB)
                                         "When Primary sender nodes pair and sync to this Hub, they will appear here with individual schedule, bandwidth, and traffic statistics."
@@ -1573,199 +1780,272 @@ private fun DashboardScreen(
                             }
                         }
                     } else {
-                        Spacer(modifier = Modifier.height(8.dp))
-                        connectedDevices.forEach { dev ->
+                        Spacer(modifier = Modifier.height(10.dp))
+                        displayDevices.forEach { dev ->
                             ConnectedDeviceRow(
                                 device = dev,
                                 onConfigure = {
-                                    Toast.makeText(context, "Configuring ${dev.deviceName}", Toast.LENGTH_SHORT).show()
                                     onConfigureDevice(dev)
                                 }
                             )
-                            Spacer(modifier = Modifier.height(6.dp))
+                            Spacer(modifier = Modifier.height(8.dp))
                         }
                     }
                 }
             }
         }
 
-        // Secondary Hub Recent Committed Files Ledger
+        // Secondary Hub Recent Committed Files Ledger (Self-Contained Scrolling Box)
         if (recentHubFiles.isNotEmpty()) {
             item {
-                Text(
-                    text = "Recent Atomic Commits to Hub DCIM/Camera",
-                    style = MaterialTheme.typography.titleMedium
-                )
-            }
-            items(recentHubFiles.take(10), key = { it.sha256 }) { entry ->
                 Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable {
-                            onPreviewMedia(
-                                PreviewMediaData(
-                                    title = entry.finalFileName,
-                                    contentUri = entry.savedUri,
-                                    fileSize = entry.fileSize,
-                                    bucketOrSource = entry.sourceDevice,
-                                    sha256 = entry.sha256,
-                                    timestamp = entry.receivedAt
-                                )
-                            )
-                        },
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(18.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
                     border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
                 ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(12.dp),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Box(
-                            contentAlignment = Alignment.Center,
-                            modifier = Modifier
-                                .size(40.dp)
-                                .clip(RoundedCornerShape(8.dp))
-                                .background(EmeraldNeon.copy(alpha = 0.15f))
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Icon(
-                                imageVector = if (entry.finalFileName.substringAfterLast('.', "").lowercase() in setOf("mp4", "mov", "mkv", "webm", "3gp")) {
-                                    Icons.Default.Movie
-                                } else {
-                                    Icons.Default.Image
-                                },
-                                contentDescription = "Preview",
-                                tint = EmeraldNeon,
-                                modifier = Modifier.size(22.dp)
+                            Text(
+                                text = "Recent Atomic Commits to Hub",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold
                             )
+                            Surface(
+                                shape = RoundedCornerShape(10.dp),
+                                color = EmeraldNeon.copy(alpha = 0.15f)
+                            ) {
+                                Text(
+                                    text = "${recentHubFiles.size} Files",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = EmeraldNeon,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                )
+                            }
                         }
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = entry.finalFileName,
-                                style = MaterialTheme.typography.bodyMedium,
-                                fontWeight = FontWeight.SemiBold,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            Spacer(modifier = Modifier.height(3.dp))
-                            Text(
-                                text = "SHA-256: ${entry.sha256.take(16)}... • From ${entry.sourceDevice}",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-                        Column(horizontalAlignment = Alignment.End) {
-                            Text(
-                                text = formatBytes(entry.fileSize),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = EmeraldNeon
-                            )
-                            Spacer(modifier = Modifier.height(2.dp))
-                            Text(
-                                text = "Tap to view",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
-                            )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 280.dp)
+                                .verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            recentHubFiles.forEach { entry ->
+                                Card(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable {
+                                            onPreviewMedia(
+                                                PreviewMediaData(
+                                                    title = entry.finalFileName,
+                                                    contentUri = entry.savedUri,
+                                                    fileSize = entry.fileSize,
+                                                    bucketOrSource = entry.sourceDevice,
+                                                    sha256 = entry.sha256,
+                                                    timestamp = entry.receivedAt
+                                                )
+                                            )
+                                        },
+                                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(12.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Box(
+                                            contentAlignment = Alignment.Center,
+                                            modifier = Modifier
+                                                .size(40.dp)
+                                                .clip(RoundedCornerShape(8.dp))
+                                                .background(EmeraldNeon.copy(alpha = 0.15f))
+                                        ) {
+                                            Icon(
+                                                imageVector = if (entry.finalFileName.substringAfterLast('.', "").lowercase() in setOf("mp4", "mov", "mkv", "webm", "3gp")) {
+                                                    Icons.Default.Movie
+                                                } else {
+                                                    Icons.Default.Image
+                                                },
+                                                contentDescription = "Preview",
+                                                tint = EmeraldNeon,
+                                                modifier = Modifier.size(22.dp)
+                                            )
+                                        }
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                text = entry.finalFileName,
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                fontWeight = FontWeight.SemiBold,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                            Spacer(modifier = Modifier.height(3.dp))
+                                            Text(
+                                                text = "SHA-256: ${entry.sha256.take(16)}... • From ${entry.sourceDevice}",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        }
+                                        Column(horizontalAlignment = Alignment.End) {
+                                            Text(
+                                                text = formatBytes(entry.fileSize),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = EmeraldNeon
+                                            )
+                                            Spacer(modifier = Modifier.height(2.dp))
+                                            Text(
+                                                text = "Tap to view",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
         }
 
-        // Primary Phone Recent Uploaded Files Ledger (Shows file name, local file path, size & bucket)
+        // Primary Phone Recent Uploaded Files Ledger (Self-Contained Scrolling Box)
         if (role == DeviceRole.PRIMARY_SENDER && recentUploadedFiles.isNotEmpty()) {
             item {
-                Text(
-                    text = "Recent Uploaded Files Relayed to Hub (${recentUploadedFiles.size})",
-                    style = MaterialTheme.typography.titleMedium
-                )
-            }
-            items(recentUploadedFiles.take(15), key = { it.filePath }) { entry ->
                 Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable {
-                            Toast.makeText(context, "Viewing: ${entry.fileName}", Toast.LENGTH_SHORT).show()
-                            onPreviewMedia(
-                                PreviewMediaData(
-                                    title = entry.fileName,
-                                    filePath = entry.filePath,
-                                    fileSize = entry.fileSize,
-                                    bucketOrSource = entry.bucketName ?: "DCIM",
-                                    sha256 = entry.sha256,
-                                    timestamp = entry.lastModified
-                                )
-                            )
-                        },
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(18.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
                     border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
                 ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(12.dp),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Box(
-                            contentAlignment = Alignment.Center,
-                            modifier = Modifier
-                                .size(40.dp)
-                                .clip(RoundedCornerShape(8.dp))
-                                .background(EmeraldNeon.copy(alpha = 0.15f))
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Icon(
-                                imageVector = if (entry.fileName.substringAfterLast('.', "").lowercase() in setOf("mp4", "mov", "mkv", "webm", "3gp")) {
-                                    Icons.Default.Movie
-                                } else {
-                                    Icons.Default.Image
-                                },
-                                contentDescription = "Preview",
-                                tint = EmeraldNeon,
-                                modifier = Modifier.size(22.dp)
+                            Text(
+                                text = "Recent Uploaded Files Relayed",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold
                             )
+                            Surface(
+                                shape = RoundedCornerShape(10.dp),
+                                color = EmeraldNeon.copy(alpha = 0.15f)
+                            ) {
+                                Text(
+                                    text = "${recentUploadedFiles.size} Files",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = EmeraldNeon,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                )
+                            }
                         }
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = entry.fileName,
-                                style = MaterialTheme.typography.bodyMedium,
-                                fontWeight = FontWeight.SemiBold,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            Spacer(modifier = Modifier.height(3.dp))
-                            Text(
-                                text = entry.filePath,
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            Spacer(modifier = Modifier.height(2.dp))
-                            Text(
-                                text = "SHA-256: ${entry.sha256.take(16)}... • ${entry.bucketName ?: "DCIM"}",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-                        Column(horizontalAlignment = Alignment.End) {
-                            Text(
-                                text = formatBytes(entry.fileSize),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = EmeraldNeon
-                            )
-                            Spacer(modifier = Modifier.height(2.dp))
-                            Text(
-                                text = "Uploaded",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = EmeraldNeon.copy(alpha = 0.8f)
-                            )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 280.dp)
+                                .verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            recentUploadedFiles.forEach { entry ->
+                                Card(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable {
+                                            Toast.makeText(context, "Viewing: ${entry.fileName}", Toast.LENGTH_SHORT).show()
+                                            onPreviewMedia(
+                                                PreviewMediaData(
+                                                    title = entry.fileName,
+                                                    filePath = entry.filePath,
+                                                    fileSize = entry.fileSize,
+                                                    bucketOrSource = entry.bucketName ?: "DCIM",
+                                                    sha256 = entry.sha256,
+                                                    timestamp = entry.lastModified
+                                                )
+                                            )
+                                        },
+                                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(12.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Box(
+                                            contentAlignment = Alignment.Center,
+                                            modifier = Modifier
+                                                .size(40.dp)
+                                                .clip(RoundedCornerShape(8.dp))
+                                                .background(EmeraldNeon.copy(alpha = 0.15f))
+                                        ) {
+                                            Icon(
+                                                imageVector = if (entry.fileName.substringAfterLast('.', "").lowercase() in setOf("mp4", "mov", "mkv", "webm", "3gp")) {
+                                                    Icons.Default.Movie
+                                                } else {
+                                                    Icons.Default.Image
+                                                },
+                                                contentDescription = "Preview",
+                                                tint = EmeraldNeon,
+                                                modifier = Modifier.size(22.dp)
+                                            )
+                                        }
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                text = entry.fileName,
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                fontWeight = FontWeight.SemiBold,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                            Spacer(modifier = Modifier.height(3.dp))
+                                            Text(
+                                                text = entry.filePath,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                            Spacer(modifier = Modifier.height(2.dp))
+                                            Text(
+                                                text = "SHA-256: ${entry.sha256.take(16)}... • ${entry.bucketName ?: "DCIM"}",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        }
+                                        Column(horizontalAlignment = Alignment.End) {
+                                            Text(
+                                                text = formatBytes(entry.fileSize),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = EmeraldNeon
+                                            )
+                                            Spacer(modifier = Modifier.height(2.dp))
+                                            Text(
+                                                text = "Uploaded",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = EmeraldNeon.copy(alpha = 0.8f)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1807,6 +2087,47 @@ private fun FoldersScreen(
                         text = "Check folders for automated background syncing, or tap 'Upload' on a folder to relay only files in that folder. Tap any file to preview.",
                         style = MaterialTheme.typography.bodyMedium
                     )
+                }
+            }
+        }
+
+        if (buckets.isEmpty()) {
+            item {
+                Surface(
+                    shape = RoundedCornerShape(18.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 16.dp)
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(32.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Folder,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.6f),
+                            modifier = Modifier.size(56.dp)
+                        )
+                        Spacer(modifier = Modifier.height(14.dp))
+                        Text(
+                            text = "No Media Folders Discovered",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = "Ensure storage and media permissions are granted so AuraSync can index photos and videos on this device.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                        )
+                    }
                 }
             }
         }
@@ -1981,6 +2302,7 @@ private fun NetworkAndVaultScreen(
     onLaunchBiometricPrompt: () -> Unit
 ) {
     val context = LocalContext.current
+    val haptic = LocalHapticFeedback.current
     val role by viewModel.deviceRole.collectAsState()
     val isVaultUnlocked by viewModel.isVaultUnlocked.collectAsState()
     val isPinConfigured by viewModel.isPinConfigured.collectAsState()
@@ -1993,6 +2315,7 @@ private fun NetworkAndVaultScreen(
     val isOnWifi by viewModel.isOnWifi.collectAsState()
     val trustedSsids by viewModel.trustedSsids.collectAsState()
     val restrictWifi by viewModel.restrictToTrustedWifi.collectAsState()
+    val connectedDevices by viewModel.connectedDevices.collectAsState()
 
     var pinInput by rememberSaveable { mutableStateOf("") }
     var confirmPinInput by rememberSaveable { mutableStateOf("") }
@@ -2043,6 +2366,25 @@ private fun NetworkAndVaultScreen(
                         )
                         Spacer(modifier = Modifier.height(16.dp))
 
+                        val lockoutRemainingMs = remember(pinInput) { viewModel.getPinLockoutRemainingMs() }
+                        if (lockoutRemainingMs > 0) {
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = CrimsonAlert.copy(alpha = 0.15f),
+                                border = BorderStroke(1.dp, CrimsonAlert),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(bottom = 12.dp)
+                            ) {
+                                Text(
+                                    text = "⚠️ Vault locked due to failed attempts. Try again in ${lockoutRemainingMs / 1000}s or unlock via Biometric.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = CrimsonAlert,
+                                    modifier = Modifier.padding(10.dp)
+                                )
+                            }
+                        }
+
                         OutlinedTextField(
                             value = pinInput,
                             onValueChange = { if (it.length <= 6 && it.all(Char::isDigit)) pinInput = it },
@@ -2050,6 +2392,7 @@ private fun NetworkAndVaultScreen(
                             visualTransformation = PasswordVisualTransformation(),
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
                             singleLine = true,
+                            enabled = lockoutRemainingMs <= 0,
                             modifier = Modifier.fillMaxWidth()
                         )
 
@@ -2075,9 +2418,10 @@ private fun NetworkAndVaultScreen(
                             ) {
                                 Button(
                                     onClick = {
-                                        viewModel.verifyOrSetVaultPin(pinInput)
+                                        viewModel.verifyVaultPin(pinInput)
                                         pinInput = ""
                                     },
+                                    enabled = lockoutRemainingMs <= 0 && pinInput.length == 6,
                                     modifier = Modifier
                                         .weight(1f)
                                         .height(46.dp),
@@ -2156,15 +2500,30 @@ private fun NetworkAndVaultScreen(
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
-                            AssistChip(
-                                onClick = {},
-                                label = {
-                                    Text(
-                                        text = if (role == DeviceRole.SECONDARY_HUB) "Receiver" else "Sender",
-                                        maxLines = 1
-                                    )
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                OutlinedButton(
+                                    onClick = { viewModel.lockVault() },
+                                    shape = RoundedCornerShape(10.dp),
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                    modifier = Modifier.height(32.dp)
+                                ) {
+                                    Icon(Icons.Default.Lock, contentDescription = null, modifier = Modifier.size(14.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("Lock", style = MaterialTheme.typography.labelSmall)
                                 }
-                            )
+                                AssistChip(
+                                    onClick = {},
+                                    label = {
+                                        Text(
+                                            text = if (role == DeviceRole.SECONDARY_HUB) "Receiver" else "Sender",
+                                            maxLines = 1
+                                        )
+                                    }
+                                )
+                            }
                         }
 
                         Spacer(modifier = Modifier.height(8.dp))
@@ -2336,7 +2695,7 @@ private fun NetworkAndVaultScreen(
                                             Text(
                                                 text = "Paired with: ${token.hubDeviceName}",
                                                 style = MaterialTheme.typography.titleSmall,
-                                                color = Color.White,
+                                                color = MaterialTheme.colorScheme.onSurface,
                                                 fontWeight = FontWeight.Bold
                                             )
                                             Spacer(modifier = Modifier.height(3.dp))
@@ -2492,6 +2851,79 @@ private fun NetworkAndVaultScreen(
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
+                            Spacer(modifier = Modifier.height(10.dp))
+                            if (connectedDevices.isEmpty()) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(16.dp),
+                                        strokeWidth = 2.dp,
+                                        color = EmeraldNeon
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = "Listening for Primary Sender nodes on local Wi-Fi (Port ${NetworkAndSafetyMonitor.DEFAULT_HUB_PORT})...",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            } else {
+                                Text(
+                                    text = "Connected Sender Devices on Local Wi-Fi (${connectedDevices.size}):",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = EmeraldNeon
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                                for (dev in connectedDevices) {
+                                    Surface(
+                                        color = MaterialTheme.colorScheme.surface,
+                                        shape = RoundedCornerShape(10.dp),
+                                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(vertical = 3.dp)
+                                    ) {
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(10.dp),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    text = dev.deviceName,
+                                                    style = MaterialTheme.typography.bodyMedium,
+                                                    fontWeight = FontWeight.Bold,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                                Spacer(modifier = Modifier.height(2.dp))
+                                                Text(
+                                                    text = "${dev.ipAddress} • ${dev.syncStatus}",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                )
+                                            }
+                                            Surface(
+                                                color = EmeraldNeon.copy(alpha = 0.15f),
+                                                shape = RoundedCornerShape(6.dp)
+                                            ) {
+                                                Text(
+                                                    text = if (dev.bandwidthLimitKbps <= 0) "Uncapped" else "${dev.bandwidthLimitKbps / 1024f} MB/s",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = EmeraldNeon,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         } else {
                             if (discoveredHubs.isEmpty()) {
                                 Row(
@@ -2560,7 +2992,6 @@ private fun NetworkAndVaultScreen(
                                                         sharedSecretHex = pairingToken?.e2eeSharedSecretHex ?: "",
                                                         pin = pinInput
                                                     )
-                                                    Toast.makeText(context, "Reconnecting to ${endpoint.serviceName}...", Toast.LENGTH_SHORT).show()
                                                 },
                                                 modifier = Modifier.height(36.dp),
                                                 shape = RoundedCornerShape(10.dp),
@@ -2586,7 +3017,6 @@ private fun NetworkAndVaultScreen(
                                                         sharedSecretHex = pairingToken?.e2eeSharedSecretHex ?: "",
                                                         pin = pinInput
                                                     )
-                                                    Toast.makeText(context, "Pairing with ${endpoint.serviceName}...", Toast.LENGTH_SHORT).show()
                                                 },
                                                 modifier = Modifier.height(36.dp),
                                                 shape = RoundedCornerShape(10.dp),
@@ -2786,7 +3216,8 @@ private fun UploadQueueScreen(
                                 .fillMaxWidth()
                                 .clip(RoundedCornerShape(4.dp)),
                             color = EmeraldNeon,
-                            trackColor = if (isDark) Color.White.copy(alpha = 0.15f) else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f)
+                            trackColor = if (isDark) Color.White.copy(alpha = 0.15f) else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f),
+                            strokeCap = androidx.compose.ui.graphics.StrokeCap.Round
                         )
                     }
                 }
@@ -3147,7 +3578,7 @@ private fun FirstLaunchOnboardingModal(
                         horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         OutlinedButton(
-                            onClick = { openExternalUrl(context, "https://github.com/sivaprasad2003/SyncPro") },
+                            onClick = { openExternalUrl(context, "https://github.com/sivaprasad2003/AuraSync") },
                             modifier = Modifier
                                 .weight(1f)
                                 .height(44.dp),
@@ -3160,14 +3591,14 @@ private fun FirstLaunchOnboardingModal(
                         }
 
                         OutlinedButton(
-                            onClick = { openExternalUrl(context, "https://t.me/syncproofficial") },
+                            onClick = { openExternalUrl(context, "https://t.me/aurasyncapp") },
                             modifier = Modifier
                                 .weight(1f)
                                 .height(44.dp),
                             shape = RoundedCornerShape(12.dp),
                             border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
                         ) {
-                            Icon(Icons.Default.Hub, contentDescription = null, modifier = Modifier.size(16.dp), tint = EmeraldNeon)
+                            Icon(Icons.AutoMirrored.Filled.Send, contentDescription = null, modifier = Modifier.size(16.dp), tint = EmeraldNeon)
                             Spacer(modifier = Modifier.width(6.dp))
                             Text("Telegram", fontWeight = FontWeight.SemiBold)
                         }
@@ -3407,7 +3838,7 @@ private fun AboutSyncProModal(
                 )
 
                 OutlinedButton(
-                    onClick = { openExternalUrl(context, "https://github.com/sivaprasad2003/SyncPro") },
+                    onClick = { openExternalUrl(context, "https://github.com/sivaprasad2003/AuraSync") },
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(46.dp),
@@ -3420,20 +3851,20 @@ private fun AboutSyncProModal(
                 }
 
                 OutlinedButton(
-                    onClick = { openExternalUrl(context, "https://t.me/syncproofficial") },
+                    onClick = { openExternalUrl(context, "https://t.me/aurasyncapp") },
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(46.dp),
                     shape = RoundedCornerShape(12.dp),
                     border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
                 ) {
-                    Icon(Icons.Default.Hub, contentDescription = null, modifier = Modifier.size(18.dp), tint = EmeraldNeon)
+                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = null, modifier = Modifier.size(18.dp), tint = EmeraldNeon)
                     Spacer(modifier = Modifier.width(8.dp))
                     Text("Join Official Telegram Channel", fontWeight = FontWeight.SemiBold)
                 }
 
                 Button(
-                    onClick = { openExternalUrl(context, "https://github.com/sivaprasad2003/SyncPro") },
+                    onClick = { openExternalUrl(context, "https://github.com/sivaprasad2003/AuraSync") },
                     colors = ButtonDefaults.buttonColors(containerColor = EmeraldNeon),
                     modifier = Modifier
                         .fillMaxWidth()
@@ -3489,6 +3920,19 @@ private fun ConfigExportImportModal(
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = CrimsonAlert.copy(alpha = 0.12f),
+                    border = BorderStroke(1.dp, CrimsonAlert.copy(alpha = 0.4f)),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = "⚠️ Security Notice: Exported JSON contains end-to-end pairing tokens. Store it securely and never share it publicly.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = CrimsonAlert,
+                        modifier = Modifier.padding(8.dp)
+                    )
+                }
                 OutlinedTextField(
                     value = importField,
                     onValueChange = { importField = it },
@@ -3659,6 +4103,12 @@ private fun formatBytes(bytes: Long): String {
     } else {
         String.format(Locale.US, "%.1f MB", mb)
     }
+}
+
+private fun format12HourTime(hour: Int, minute: Int): String {
+    val h = if (hour == 0) 12 else if (hour > 12) hour - 12 else hour
+    val amPm = if (hour < 12) "AM" else "PM"
+    return String.format(Locale.US, "%02d:%02d %s", h, minute, amPm)
 }
 
 private fun openExternalUrl(context: Context, url: String) {
@@ -3944,6 +4394,20 @@ private fun ConnectedDeviceRow(
     device: ConnectedDeviceEntity,
     onConfigure: () -> Unit
 ) {
+    val (statusBadge, activeFile) = remember(device.syncStatus) {
+        val raw = device.syncStatus.trim()
+        when {
+            raw.startsWith("Receiving ", ignoreCase = true) -> "Receiving" to raw.removePrefix("Receiving ").trim()
+            raw.startsWith("Sending ", ignoreCase = true) -> "Sending" to raw.removePrefix("Sending ").trim()
+            raw.startsWith("Syncing", ignoreCase = true) -> {
+                val remainder = raw.removePrefix("Syncing").trim().removePrefix(":").trim()
+                "Syncing" to remainder.ifEmpty { null }
+            }
+            raw.equals("Connected (Hub)", ignoreCase = true) -> "Hub Master" to null
+            else -> raw to null
+        }
+    }
+
     Surface(
         color = MaterialTheme.colorScheme.surface,
         shape = RoundedCornerShape(14.dp),
@@ -3955,90 +4419,192 @@ private fun ConnectedDeviceRow(
                 .fillMaxWidth()
                 .padding(14.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Box(
                 contentAlignment = Alignment.Center,
                 modifier = Modifier
-                    .size(42.dp)
-                    .clip(RoundedCornerShape(10.dp))
+                    .size(44.dp)
+                    .clip(RoundedCornerShape(12.dp))
                     .background(EmeraldNeon.copy(alpha = 0.15f))
-                    .border(1.dp, EmeraldNeon.copy(alpha = 0.35f), RoundedCornerShape(10.dp))
+                    .border(1.dp, EmeraldNeon.copy(alpha = 0.35f), RoundedCornerShape(12.dp))
             ) {
                 Icon(
                     imageVector = if (device.role == "SECONDARY_HUB") Icons.Default.Hub else Icons.Default.PhoneAndroid,
                     contentDescription = null,
                     tint = EmeraldNeon,
-                    modifier = Modifier.size(22.dp)
+                    modifier = Modifier.size(24.dp)
                 )
             }
 
-            Column(modifier = Modifier.weight(1f)) {
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
                 Row(
+                    modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Text(
                         text = device.deviceName,
-                        style = MaterialTheme.typography.bodyMedium,
+                        style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
                         maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
                     )
+                    Spacer(modifier = Modifier.width(6.dp))
                     Surface(
-                        color = when (device.syncStatus.lowercase()) {
-                            "syncing" -> EmeraldNeon.copy(alpha = 0.2f)
-                            "active" -> EmeraldNeon.copy(alpha = 0.12f)
+                        color = when (statusBadge.lowercase()) {
+                            "syncing", "receiving", "sending" -> EmeraldNeon.copy(alpha = 0.2f)
+                            "active", "hub master" -> EmeraldNeon.copy(alpha = 0.12f)
                             else -> MaterialTheme.colorScheme.surfaceVariant
                         },
                         shape = RoundedCornerShape(6.dp)
                     ) {
                         Text(
-                            text = device.syncStatus,
+                            text = statusBadge,
                             style = MaterialTheme.typography.labelSmall,
-                            color = when (device.syncStatus.lowercase()) {
-                                "syncing" -> EmeraldNeon
-                                "active" -> EmeraldNeon
+                            color = when (statusBadge.lowercase()) {
+                                "syncing", "receiving", "sending" -> EmeraldNeon
+                                "active", "hub master" -> EmeraldNeon
                                 else -> MaterialTheme.colorScheme.onSurfaceVariant
                             },
                             fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
                         )
                     }
                 }
 
-                Spacer(modifier = Modifier.height(3.dp))
+                if (!activeFile.isNullOrBlank()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(EmeraldNeon.copy(alpha = 0.08f))
+                            .padding(horizontal = 6.dp, vertical = 3.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Sync,
+                            contentDescription = null,
+                            tint = EmeraldNeon,
+                            modifier = Modifier.size(12.dp)
+                        )
+                        Text(
+                            text = activeFile,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = EmeraldNeon,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
 
-                Text(
-                    text = "IP: ${device.ipAddress} • Sync: ${device.scheduledSync}",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
+                val lastSyncText = remember(device.lastSyncedAt) {
+                    if (device.lastSyncedAt <= 0L) {
+                        "Last synced: Never"
+                    } else {
+                        val diffMs = System.currentTimeMillis() - device.lastSyncedAt
+                        when {
+                            diffMs < 60_000L -> "Synced just now"
+                            diffMs < 3600_000L -> "Synced ${diffMs / 60_000L}m ago"
+                            diffMs < 86400_000L -> "Synced ${diffMs / 3600_000L}h ago"
+                            else -> {
+                                val sdf = java.text.SimpleDateFormat("MMM dd, h:mm a", Locale.US)
+                                "Synced " + sdf.format(java.util.Date(device.lastSyncedAt))
+                            }
+                        }
+                    }
+                }
 
-                Spacer(modifier = Modifier.height(3.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        text = device.ipAddress,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = "•",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.outline
+                    )
+                    Text(
+                        text = lastSyncText,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (device.lastSyncedAt > 0L) EmeraldNeon else MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontWeight = if (device.lastSyncedAt > 0L) FontWeight.SemiBold else FontWeight.Normal,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
 
-                Text(
-                    text = "Allocated: ${if (device.bandwidthLimitKbps <= 0) "Unlimited" else "${device.bandwidthLimitKbps / 1024f} MB/s"} • Traffic: ${formatBytes(device.trafficBytes)}",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = EmeraldNeon,
-                    fontWeight = FontWeight.Medium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    val capLabel = if (device.bandwidthLimitKbps <= 0) "Cap: Uncapped" else "Cap: ${device.bandwidthLimitKbps / 1024f} MB/s"
+                    Text(
+                        text = capLabel,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = EmeraldNeon,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = "•",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.outline
+                    )
+                    Text(
+                        text = "Daily Sync: ${device.scheduledSync}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = "•",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.outline
+                    )
+                    Text(
+                        text = formatBytes(device.trafficBytes),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
             }
 
-            IconButton(
+            Surface(
                 onClick = onConfigure,
-                modifier = Modifier.size(36.dp)
+                shape = RoundedCornerShape(10.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                modifier = Modifier.size(38.dp)
             ) {
-                Icon(
-                    imageVector = Icons.Default.Tune,
-                    contentDescription = "Configure Device",
-                    tint = EmeraldNeon,
-                    modifier = Modifier.size(20.dp)
-                )
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        imageVector = Icons.Default.Tune,
+                        contentDescription = "Configure Device",
+                        tint = EmeraldNeon,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
             }
         }
     }
@@ -4230,12 +4796,27 @@ private fun SafetySettingsModal(
 @Composable
 private fun DeviceConfigModal(
     device: ConnectedDeviceEntity,
-    onUpdateBandwidth: (Int) -> Unit,
+    onSaveConfig: (bandwidthLimitKbps: Int, scheduleHour: Int, scheduleMinute: Int) -> Unit,
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
-    val presets = remember { listOf(0, 1024, 2560, 5120, 10240, 25600) }
     var selectedLimit by rememberSaveable { mutableIntStateOf(device.bandwidthLimitKbps) }
+    var scheduleHour by rememberSaveable { mutableIntStateOf(device.scheduleHour) }
+    var scheduleMinute by rememberSaveable { mutableIntStateOf(device.scheduleMinute) }
+    var showDeviceTimePicker by rememberSaveable { mutableStateOf(false) }
+
+    if (showDeviceTimePicker) {
+        SyncProTimePickerDialog(
+            title = "Set Automated Sync Timer",
+            initialHour = scheduleHour,
+            initialMinute = scheduleMinute,
+            onConfirm = { h, m ->
+                scheduleHour = h
+                scheduleMinute = m
+            },
+            onDismiss = { showDeviceTimePicker = false }
+        )
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -4248,7 +4829,7 @@ private fun DeviceConfigModal(
                 Icon(Icons.Default.Tune, contentDescription = null, tint = EmeraldNeon)
                 Spacer(modifier = Modifier.width(6.dp))
                 Text(
-                    text = "Device Bandwidth Allocation",
+                    text = "Device Network & Schedule",
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.Bold,
                     maxLines = 1,
@@ -4258,9 +4839,12 @@ private fun DeviceConfigModal(
         },
         text = {
             Column(
-                modifier = Modifier.fillMaxWidth(),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
+                // Device Summary Card
                 Surface(
                     color = MaterialTheme.colorScheme.surfaceVariant,
                     shape = RoundedCornerShape(14.dp),
@@ -4284,7 +4868,7 @@ private fun DeviceConfigModal(
                         )
                         Spacer(modifier = Modifier.height(3.dp))
                         Text(
-                            text = "Current Traffic Transferred: ${formatBytes(device.trafficBytes)}",
+                            text = "Synced Traffic: ${formatBytes(device.trafficBytes)}",
                             style = MaterialTheme.typography.labelSmall,
                             color = EmeraldNeon,
                             fontWeight = FontWeight.SemiBold
@@ -4292,35 +4876,98 @@ private fun DeviceConfigModal(
                     }
                 }
 
-                Spacer(modifier = Modifier.height(2.dp))
+                // Section 1: Maximum Relay Bandwidth (Matches Daily Automated Discrete Presets Slider)
+                val bandwidthOptions = remember { listOf(1024, 2560, 5120, 10240, 20480, 0) }
+                val currentSliderIndex = remember(selectedLimit) {
+                    val idx = bandwidthOptions.indexOf(selectedLimit)
+                    if (idx >= 0) idx.toFloat() else (bandwidthOptions.size - 1).toFloat()
+                }
 
-                Text(
-                    text = "Select Maximum Relay Bandwidth for this device:",
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.SemiBold
-                )
-
-                presets.forEach { limit ->
-                    val label = if (limit == 0) "Unlimited (Uncapped)" else "${limit / 1024f} MB/s (${limit} KB/s)"
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { selectedLimit = limit }
-                            .padding(vertical = 4.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        RadioButton(
-                            selected = selectedLimit == limit,
-                            onClick = { selectedLimit = limit },
-                            colors = RadioButtonDefaults.colors(selectedColor = EmeraldNeon)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = label,
+                            text = "Relay Bandwidth Limit",
                             style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = if (selectedLimit == limit) FontWeight.Bold else FontWeight.Normal,
-                            color = if (selectedLimit == limit) EmeraldNeon else MaterialTheme.colorScheme.onSurface
+                            fontWeight = FontWeight.SemiBold
                         )
+                        Surface(
+                            color = if (selectedLimit <= 0) EmeraldNeon.copy(alpha = 0.15f) else MaterialTheme.colorScheme.primary.copy(alpha = 0.15f),
+                            shape = RoundedCornerShape(6.dp)
+                        ) {
+                            Text(
+                                text = if (selectedLimit <= 0) "Unlimited (Max)" else "${String.format(Locale.US, "%.1f", selectedLimit / 1024f)} MB/s (${selectedLimit} KB/s)",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (selectedLimit <= 0) EmeraldNeon else MaterialTheme.colorScheme.primary,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
+
+                    Text(
+                        text = if (selectedLimit <= 0)
+                            "Uncapped: Maximum local Wi-Fi / WAN network throughput."
+                        else
+                            "Throttled to ${selectedLimit} KB/s to preserve device network resources.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    Spacer(modifier = Modifier.height(4.dp))
+
+                    Slider(
+                        value = currentSliderIndex,
+                        onValueChange = { pos ->
+                            val chosen = bandwidthOptions[pos.roundToInt().coerceIn(0, bandwidthOptions.size - 1)]
+                            selectedLimit = chosen
+                        },
+                        valueRange = 0f..(bandwidthOptions.size - 1).toFloat(),
+                        steps = bandwidthOptions.size - 2,
+                        colors = SliderDefaults.colors(
+                            thumbColor = EmeraldNeon,
+                            activeTrackColor = EmeraldNeon,
+                            inactiveTrackColor = MaterialTheme.colorScheme.outlineVariant
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+
+                // Section 2: Automated Sync Schedule Timer (Matches Daily Automated Sync Schedule)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Automated Sync Schedule Timer",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = "Daily automated sync at ${format12HourTime(scheduleHour, scheduleMinute)}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Button(
+                        onClick = {
+                            showDeviceTimePicker = true
+                        },
+                        modifier = Modifier.height(40.dp),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(Icons.Default.Schedule, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(format12HourTime(scheduleHour, scheduleMinute))
                     }
                 }
             }
@@ -4328,15 +4975,13 @@ private fun DeviceConfigModal(
         confirmButton = {
             Button(
                 onClick = {
-                    onUpdateBandwidth(selectedLimit)
-                    val label = if (selectedLimit == 0) "Unlimited" else "${selectedLimit / 1024f} MB/s"
-                    Toast.makeText(context, "Bandwidth for ${device.deviceName} set to $label", Toast.LENGTH_SHORT).show()
+                    onSaveConfig(selectedLimit, scheduleHour, scheduleMinute)
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = EmeraldNeon),
                 shape = RoundedCornerShape(12.dp),
                 modifier = Modifier.height(44.dp)
             ) {
-                Text("Save Allocation", color = Color.Black, fontWeight = FontWeight.Bold)
+                Text("Save & Sync to Device", color = Color.Black, fontWeight = FontWeight.Bold)
             }
         },
         dismissButton = {
@@ -4349,4 +4994,390 @@ private fun DeviceConfigModal(
             }
         }
     )
-}
+}
+
+
+@Composable
+private fun StorageSafetyModal(
+    viewModel: MainViewModel,
+    onDismiss: () -> Unit
+) {
+    val safety by viewModel.safetyStatus.collectAsState()
+    val storageCutoffGb by viewModel.storageCutoffGb.collectAsState()
+    var selectedCutoff by remember(storageCutoffGb) { mutableStateOf(storageCutoffGb) }
+    val context = LocalContext.current
+
+    val totalBytes = safety.totalStorageBytes
+    val availBytes = safety.availableStorageBytes
+    val usedBytes = (totalBytes - availBytes).coerceAtLeast(0L)
+    val usedRatio = if (totalBytes > 0L) (usedBytes.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f) else 0f
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier
+                        .size(36.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(EmeraldNeon.copy(alpha = 0.15f))
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Storage,
+                        contentDescription = null,
+                        tint = EmeraldNeon,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+                Column {
+                    Text("Storage & Safety Guard", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                    Text("Manage storage threshold for automated transfers", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                // Storage Bar Breakdown
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                ) {
+                    Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text("Used: ${formatBytes(usedBytes)}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text("Free: ${formatBytes(availBytes)}", style = MaterialTheme.typography.labelSmall, color = EmeraldNeon, fontWeight = FontWeight.Bold)
+                        }
+                        LinearProgressIndicator(
+                            progress = { usedRatio },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(8.dp)
+                                .clip(RoundedCornerShape(4.dp)),
+                            color = if (safety.isLowStorageTripped) CrimsonAlert else EmeraldNeon,
+                            trackColor = MaterialTheme.colorScheme.surfaceVariant,
+                            strokeCap = androidx.compose.ui.graphics.StrokeCap.Round
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text("Total Storage", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(formatBytes(totalBytes), style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                }
+
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+
+                // Editable Storage Cutoff Threshold Slider & Presets
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Minimum Free Storage Cutoff", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            text = "${String.format(Locale.US, "%.1f", selectedCutoff)} GB",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = EmeraldNeon,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    Text(
+                        text = "Transfers will pause/reject when available storage falls below this threshold to safeguard host filesystem stability.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Slider(
+                        value = selectedCutoff,
+                        onValueChange = { selectedCutoff = (kotlin.math.round(it * 2f) / 2f) },
+                        valueRange = 0.5f..10.0f,
+                        steps = 18,
+                        colors = SliderDefaults.colors(
+                            thumbColor = EmeraldNeon,
+                            activeTrackColor = EmeraldNeon,
+                            inactiveTrackColor = MaterialTheme.colorScheme.outlineVariant
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    // Quick Preset Chips (0.5GB, 1GB, 2GB, 3GB, 5GB)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        listOf(0.5f, 1.0f, 2.0f, 3.0f, 5.0f).forEach { preset ->
+                            val isChosen = kotlin.math.abs(selectedCutoff - preset) < 0.05f
+                            Surface(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clickable { selectedCutoff = preset },
+                                shape = RoundedCornerShape(8.dp),
+                                color = if (isChosen) EmeraldNeon else MaterialTheme.colorScheme.surfaceVariant,
+                                border = BorderStroke(
+                                    1.dp,
+                                    if (isChosen) EmeraldNeon else MaterialTheme.colorScheme.outlineVariant
+                                )
+                            ) {
+                                Text(
+                                    text = if (preset == 0.5f) "0.5G" else "${preset.toInt()}G",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = if (isChosen) FontWeight.Bold else FontWeight.Medium,
+                                    color = if (isChosen) Color.Black else MaterialTheme.colorScheme.onSurface,
+                                    modifier = Modifier.padding(vertical = 6.dp),
+                                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    viewModel.setStorageCutoffGb(selectedCutoff)
+                    Toast.makeText(context, "Storage cutoff updated to ${String.format(Locale.US, "%.1f", selectedCutoff)} GB", Toast.LENGTH_SHORT).show()
+                    onDismiss()
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = EmeraldNeon),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.height(44.dp)
+            ) {
+                Text("Save Cutoff Limit", color = Color.Black, fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = onDismiss,
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.height(44.dp)
+            ) {
+                Text("Cancel")
+            }
+        }
+    )
+}
+
+@Composable
+private fun HubVaultDetailsModal(
+    viewModel: MainViewModel,
+    onDismiss: () -> Unit
+) {
+    val role by viewModel.deviceRole.collectAsState()
+    val telemetry by viewModel.telemetry.collectAsState()
+    val hubReceivedCount by viewModel.hubReceivedCount.collectAsState()
+    val hubReceivedBytes by viewModel.hubReceivedBytes.collectAsState()
+    val syncedLocalCount by viewModel.syncedLocalCount.collectAsState()
+    val syncedLocalBytes by viewModel.syncedLocalBytes.collectAsState()
+    val recentHubFiles by viewModel.recentHubFiles.collectAsState()
+    val recentUploadedFiles by viewModel.recentUploadedFiles.collectAsState()
+    val connectedDevices by viewModel.connectedDevices.collectAsState()
+
+    val totalFiles = if (role == DeviceRole.SECONDARY_HUB) hubReceivedCount else syncedLocalCount
+    val totalTraffic = if (role == DeviceRole.SECONDARY_HUB) hubReceivedBytes else syncedLocalBytes
+
+    val latestTimestamp = remember(recentHubFiles, recentUploadedFiles, connectedDevices) {
+        val fromRecentHub = recentHubFiles.firstOrNull()?.receivedAt ?: 0L
+        val fromRecentUpload = recentUploadedFiles.firstOrNull()?.lastModified ?: 0L
+        val fromDevices = connectedDevices.maxOfOrNull { it.lastSyncedAt } ?: 0L
+        maxOf(fromRecentHub, maxOf(fromRecentUpload, fromDevices))
+    }
+
+    val lastSyncFormatted = remember(latestTimestamp) {
+        if (latestTimestamp <= 0L) {
+            "Never synced"
+        } else {
+            val sdf = java.text.SimpleDateFormat("MMM dd, yyyy • h:mm a", Locale.US)
+            sdf.format(java.util.Date(latestTimestamp))
+        }
+    }
+
+    val isSyncActive = telemetry.isRunning || telemetry.queuedFileCount > 0 || telemetry.isHubBusyWithSync
+    val currentStatusText = if (isSyncActive) "Syncing" else "Standby (Free)"
+    val currentDeviceSending = if (isSyncActive) {
+        if (telemetry.sourceDeviceName.isNotBlank()) telemetry.sourceDeviceName else "Active Node"
+    } else {
+        "None (Idle)"
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier
+                        .size(36.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(EmeraldNeon.copy(alpha = 0.15f))
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.CloudDone,
+                        contentDescription = null,
+                        tint = EmeraldNeon,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+                Column {
+                    Text("Hub Vault Storage Ledger", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                    Text("Realtime vault statistics & peer relay status", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                // Key Metrics Grid: Total Files Received & Total Traffic
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Card(
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            Text("Total Files Received", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text("$totalFiles Files", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = EmeraldNeon)
+                        }
+                    }
+
+                    Card(
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            Text("Total Traffic", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(formatBytes(totalTraffic), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = EmeraldNeon)
+                        }
+                    }
+                }
+
+                // Current Live Status & Sending Device
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    border = BorderStroke(1.dp, if (isSyncActive) EmeraldNeon else MaterialTheme.colorScheme.outlineVariant)
+                ) {
+                    Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("Current Hub Status", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                            Surface(
+                                shape = RoundedCornerShape(6.dp),
+                                color = if (isSyncActive) EmeraldNeon.copy(alpha = 0.2f) else MaterialTheme.colorScheme.surfaceVariant
+                            ) {
+                                Text(
+                                    text = currentStatusText,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (isSyncActive) EmeraldNeon else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                )
+                            }
+                        }
+
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("Device Sending / Sync From", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(
+                                text = currentDeviceSending,
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = if (isSyncActive) EmeraldNeon else MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+
+                        if (isSyncActive) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("Relay Speed", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text(
+                                    text = "${String.format(Locale.US, "%.1f", telemetry.currentSpeedMbps)} Mbps",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = EmeraldNeon,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // Last Sync Timestamp Card
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(14.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column {
+                            Text("Last Synced Time", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(lastSyncFormatted, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Icon(Icons.Default.Schedule, contentDescription = null, tint = EmeraldNeon, modifier = Modifier.size(20.dp))
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = onDismiss,
+                colors = ButtonDefaults.buttonColors(containerColor = EmeraldNeon),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.height(44.dp)
+            ) {
+                Text("Close", color = Color.Black, fontWeight = FontWeight.Bold)
+            }
+        }
+    )
+}

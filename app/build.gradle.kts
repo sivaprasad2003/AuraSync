@@ -1,4 +1,6 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import java.util.Properties
+import java.io.FileInputStream
 
 plugins {
     alias(libs.plugins.android.application)
@@ -26,10 +28,16 @@ android {
 
     signingConfigs {
         create("release") {
-            storeFile = file("release-test.jks")
-            storePassword = "aurasync_testing"
-            keyAlias = "aurasync"
-            keyPassword = "aurasync_testing"
+            val props = Properties()
+            val localPropsFile = rootProject.file("local.properties")
+            if (localPropsFile.exists()) {
+                FileInputStream(localPropsFile).use { props.load(it) }
+            }
+            val keyFile = props.getProperty("KEYSTORE_FILE")
+            storeFile = if (!keyFile.isNullOrEmpty()) file(keyFile) else null
+            storePassword = props.getProperty("KEYSTORE_PASS") ?: ""
+            keyAlias = props.getProperty("KEY_ALIAS") ?: ""
+            keyPassword = props.getProperty("KEY_PASS") ?: ""
         }
     }
 

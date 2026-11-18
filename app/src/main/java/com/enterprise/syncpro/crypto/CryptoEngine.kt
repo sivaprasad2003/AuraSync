@@ -98,7 +98,7 @@ object CryptoEngine {
         val keyBytes = MessageDigest.getInstance("SHA-256")
             .digest(sharedSecretHex.toByteArray(Charsets.UTF_8))
         val ivFull = MessageDigest.getInstance("SHA-256")
-            .digest(fileSha256.toByteArray(Charsets.UTF_8))
+            .digest("AuraSync-CTR-IV-v1:$fileSha256".toByteArray(Charsets.UTF_8))
         val iv16 = ivFull.copyOfRange(0, 16)
 
         val cipher = Cipher.getInstance("AES/CTR/NoPadding")
@@ -121,6 +121,23 @@ object CryptoEngine {
         } else {
             "${sanitized}_$hashSuffix"
         }
+    }
+
+    fun hashPinPbkdf2(pin: String, saltBytes: ByteArray): String {
+        val spec = javax.crypto.spec.PBEKeySpec(
+            "SYNCPRO_VAULT_SALT:$pin".toCharArray(),
+            saltBytes,
+            310_000,
+            256
+        )
+        val factory = javax.crypto.SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
+        return factory.generateSecret(spec).encoded.toHexString()
+    }
+
+    fun generateSalt(byteCount: Int = 16): ByteArray {
+        val bytes = ByteArray(byteCount)
+        SecureRandom().nextBytes(bytes)
+        return bytes
     }
 
     private fun ByteArray.toHexString(): String {

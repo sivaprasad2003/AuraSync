@@ -14,6 +14,8 @@ import com.enterprise.syncpro.data.PairingToken
 import com.enterprise.syncpro.data.SyncDatabase
 import com.enterprise.syncpro.data.VaultManager
 import java.util.Locale
+import kotlin.math.log10
+import kotlin.math.pow
 import com.enterprise.syncpro.media.MediaAndQrEngine
 import com.enterprise.syncpro.media.MediaBucketSummary
 import com.enterprise.syncpro.network.DiscoveredHubEndpoint
@@ -25,11 +27,16 @@ import com.enterprise.syncpro.network.TransferLiveTelemetry
 import com.enterprise.syncpro.service.HubForegroundService
 import com.enterprise.syncpro.service.SyncWorkers
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -54,6 +61,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val instantCaptureSync: StateFlow<Boolean> = vault.instantCaptureSync
     val devicePriorityWeight: StateFlow<Int> = vault.devicePriorityWeight
     val isPinConfigured: StateFlow<Boolean> = vault.isPinConfigured
+
+    fun getPinLockoutRemainingMs(): Long = vault.getPinLockoutRemainingMs()
 
     val telemetry: StateFlow<TransferLiveTelemetry> = relayEngine.telemetry
     val safetyStatus: StateFlow<HardwareSafetyStatus> = networkMonitor.safetyStatus
@@ -82,6 +91,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     val tempCutoffCelsius: StateFlow<Float> = vault.tempCutoffCelsius
     val batteryCutoffPercent: StateFlow<Int> = vault.batteryCutoffPercent
+    val throttleStartHour: StateFlow<Int> = vault.throttleStartHour
+    val throttleStartMinute: StateFlow<Int> = vault.throttleStartMinute
+    val throttleEndHour: StateFlow<Int> = vault.throttleEndHour
+    val throttleEndMinute: StateFlow<Int> = vault.throttleEndMinute
+    val storageCutoffGb: StateFlow<Float> = vault.storageCutoffGb
 
     private val _mediaBuckets = MutableStateFlow<List<MediaBucketSummary>>(emptyList())
     val mediaBuckets: StateFlow<List<MediaBucketSummary>> = _mediaBuckets.asStateFlow()
@@ -95,13 +109,36 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _exportedConfigJson = MutableStateFlow("")
     val exportedConfigJson: StateFlow<String> = _exportedConfigJson.asStateFlow()
 
-    private val _uiToastMessage = MutableStateFlow<String?>(null)
-    val uiToastMessage: StateFlow<String?> = _uiToastMessage.asStateFlow()
+    private val _toastEvent = Channel<String>(Channel.BUFFERED)
+    val toastFlow: Flow<String> = _toastEvent.receiveAsFlow()
+
+    private val _myDeviceId = MutableStateFlow("")
+    val myDeviceId: StateFlow<String> = _myDeviceId.asStateFlow()
+    val myFriendlyName: String = vault.getDeviceFriendlyName()
+
+    fun postToast(msg: String) {
+        viewModelScope.launch {
+            _toastEvent.send(msg)
+        }
+    }
+
+    fun formatBytes(bytes: Long): String {
+        if (bytes <= 0) return "0 B"
+        val units = arrayOf("B", "KB", "MB", "GB", "TB")
+        val digitGroups = (log10(bytes.toDouble()) / log10(1024.0)).toInt().coerceIn(0, units.size - 1)
+        return String.format(Locale.US, "%.1f %s", bytes / 1024.0.pow(digitGroups.toDouble()), units[digitGroups])
+    }
 
     private val _isRefreshing = MutableStateFlow(false)
     val isRefreshing: StateFlow<Boolean> = _isRefreshing.asStateFlow()
 
     init {
+        relayEngine.onSafetyAlertReceived = { alertText ->
+            postToast(alertText)
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            _myDeviceId.value = vault.getOrCreateDeviceId()
+        }
         if (vault.deviceRole.value == DeviceRole.SECONDARY_HUB) {
             relayEngine.startSecondaryHubServer(NetworkAndSafetyMonitor.DEFAULT_HUB_PORT)
             HubForegroundService.startOrUpdate(appContext)
@@ -110,10 +147,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         SyncWorkers.scheduleDailyAutomatedSync(appContext)
         refreshAllState()
-    }
+        refreshConnectedDevices()
 
-    fun clearToastMessage() {
-        _uiToastMessage.value = null
+        // Real-time peer registration heartbeat (runs every 8s while active)
+        viewModelScope.launch(Dispatchers.IO) {
+            while (isActive) {
+                delay(8000)
+                if (vault.deviceRole.value == DeviceRole.PRIMARY_SENDER && vault.pairingToken.value != null) {
+                    refreshConnectedDevices()
+                }
+            }
+        }
     }
 
     fun refreshAllState() {
@@ -131,13 +175,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     val hubId = vault.getOrCreateDeviceId()
                     val secretHex = vault.getOrCreateHubSecretHex()
                     val pinHash = vault.getPinHashOrDefault()
-                    networkMonitor.startMdnsHubBroadcast(NetworkAndSafetyMonitor.DEFAULT_HUB_PORT, hubId, secretHex, pinHash)
+                    networkMonitor.startMdnsHubBroadcast(NetworkAndSafetyMonitor.DEFAULT_HUB_PORT, hubId)
                     relayEngine.startSecondaryHubServer(NetworkAndSafetyMonitor.DEFAULT_HUB_PORT)
                     HubForegroundService.startOrUpdate(appContext)
                 } else {
                     networkMonitor.startMdnsDiscovery()
                 }
-                _uiToastMessage.value = "Telemetry, media index & network discovery refreshed"
+                refreshConnectedDevices()
+                postToast("Telemetry, media index & network discovery refreshed")
             } finally {
                 kotlinx.coroutines.delay(600)
                 _isRefreshing.value = false
@@ -191,7 +236,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val hubId = vault.getOrCreateDeviceId()
                 val secretHex = vault.getOrCreateHubSecretHex()
                 val pinHash = vault.getPinHashOrDefault()
-                networkMonitor.startMdnsHubBroadcast(NetworkAndSafetyMonitor.DEFAULT_HUB_PORT, hubId, secretHex, pinHash)
+                networkMonitor.startMdnsHubBroadcast(NetworkAndSafetyMonitor.DEFAULT_HUB_PORT, hubId)
                 relayEngine.startSecondaryHubServer(NetworkAndSafetyMonitor.DEFAULT_HUB_PORT)
                 HubForegroundService.startOrUpdate(appContext)
             } else {
@@ -219,23 +264,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _isVaultUnlocked.value = true
     }
 
+    fun lockVault() {
+        _isVaultUnlocked.value = false
+        postToast("Vault Locked")
+    }
+
     fun initializeVaultPin(pin: String, confirmPin: String) {
         viewModelScope.launch(Dispatchers.IO) {
             if (pin.length != 6 || !pin.all(Char::isDigit)) {
-                _uiToastMessage.value = "PIN must be exactly 6 digits"
+                postToast("PIN must be exactly 6 digits")
                 return@launch
             }
             if (pin != confirmPin) {
-                _uiToastMessage.value = "PINs do not match"
+                postToast("PINs do not match")
                 return@launch
             }
             val ok = vault.configurePin(pin)
             if (ok) {
                 _isVaultUnlocked.value = true
                 regenerateHubPairingQr()
-                _uiToastMessage.value = "Vault PIN Set"
+                postToast("Vault PIN Set")
             } else {
-                _uiToastMessage.value = "Failed to configure PIN"
+                postToast("Failed to configure PIN")
             }
         }
     }
@@ -245,18 +295,45 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val verified = vault.verifyPin(pin)
             if (verified) {
                 _isVaultUnlocked.value = true
-                _uiToastMessage.value = "Vault Unlocked"
+                postToast("Vault Unlocked")
             } else {
-                _uiToastMessage.value = "Incorrect PIN"
+                postToast("Incorrect PIN")
             }
         }
     }
 
     fun verifyOrSetVaultPin(pin: String) {
-        if (!vault.isPinConfigured.value) {
-            initializeVaultPin(pin, pin)
-        } else {
+        // Only use for verification of an already-configured PIN.
+        // PIN initialization always requires separate confirm input from the UI.
+        if (vault.isPinConfigured.value) {
             verifyVaultPin(pin)
+        } else {
+            // Should not reach here from UI — UI shows two separate fields for new PIN
+            postToast("Please use the Set PIN form with confirmation")
+        }
+    }
+
+    fun changeVaultPin(currentPin: String, newPin: String, confirmNewPin: String) {
+        if (newPin != confirmNewPin) {
+            postToast("New PIN and confirmation do not match")
+            return
+        }
+        if (newPin.length != 6 || !newPin.all { it.isDigit() }) {
+            postToast("PIN must be exactly 6 numeric digits")
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            val success = vault.changePin(currentPin, newPin)
+            if (success) {
+                postToast("Vault PIN updated successfully")
+            } else {
+                val lockoutMs = vault.getPinLockoutRemainingMs()
+                if (lockoutMs > 0) {
+                    postToast("Too many failed attempts. Locked for ${lockoutMs / 1000}s")
+                } else {
+                    postToast("Current PIN is incorrect")
+                }
+            }
         }
     }
 
@@ -265,14 +342,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val token = vault.decodePairingTokenFromJson(rawJson)
             if (token != null) {
                 vault.savePairingToken(token)
+                refreshConnectedDevices()
                 relayEngine.logEvent(
                     "SECURITY",
                     "QRPairing",
                     "Paired with Hub ${token.hubDeviceName} (${token.localIp} / ${token.tailscaleOrWanHost})"
                 )
-                _uiToastMessage.value = "Paired with ${token.hubDeviceName}"
+                postToast("Paired with ${token.hubDeviceName}")
             } else {
-                _uiToastMessage.value = "Invalid QR Code"
+                postToast("Invalid QR Code")
             }
         }
     }
@@ -281,15 +359,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             val effectiveSecret = if (sharedSecretHex.isNotBlank()) {
                 sharedSecretHex
-            } else if (endpoint.secretHex.isNotBlank()) {
-                endpoint.secretHex
             } else {
-                pairingToken.value?.e2eeSharedSecretHex ?: ""
+                pairingToken.value?.e2eeSharedSecretHex ?: vault.getOrCreateHubSecretHex()
             }
             val pinHash = if (pin.length == 6) {
                 com.enterprise.syncpro.crypto.CryptoEngine.sha256String("SYNCPRO_VAULT_SALT:$pin")
-            } else if (endpoint.pinHash.isNotBlank()) {
-                endpoint.pinHash
             } else {
                 vault.getPinHashOrDefault()
             }
@@ -303,7 +377,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 e2eeSharedSecretHex = effectiveSecret
             )
             vault.savePairingToken(token)
-            _uiToastMessage.value = "Connected to ${endpoint.serviceName}"
+            refreshConnectedDevices()
+            postToast("Connected to ${endpoint.serviceName}")
         }
     }
 
@@ -318,7 +393,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     tailscaleOrWanHost = trimmed
                 )
                 vault.savePairingToken(updated)
-                _uiToastMessage.value = "Updated Hub Route: $trimmed"
+                refreshConnectedDevices()
+                postToast("Updated Hub Route: $trimmed")
             } else {
                 val token = PairingToken(
                     hubDeviceId = "ManualHub",
@@ -330,13 +406,38 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     e2eeSharedSecretHex = vault.getOrCreateHubSecretHex()
                 )
                 vault.savePairingToken(token)
-                _uiToastMessage.value = "Set Hub Route: $trimmed"
+                refreshConnectedDevices()
+                postToast("Set Hub Route: $trimmed")
             }
         }
     }
 
     fun startFullBatchSyncNow() {
         viewModelScope.launch(Dispatchers.IO) {
+            val safety = networkMonitor.evaluateHardwareSafetyGuards(
+                tempCutoff = vault.tempCutoffCelsius.value,
+                batteryCutoff = vault.batteryCutoffPercent.value,
+                storageCutoffGb = vault.storageCutoffGb.value
+            )
+            if (!safety.isSafeToSync) {
+                val reason = when {
+                    safety.isThermalTripped -> "Battery temperature (${String.format(Locale.US, "%.1f", safety.temperatureCelsius)}°C) exceeds cutoff (${vault.tempCutoffCelsius.value}°C)"
+                    safety.isLowBatteryTripped -> "Battery (${safety.batteryPercent}%) is below cutoff (${vault.batteryCutoffPercent.value}%)"
+                    else -> "Free storage (${formatBytes(safety.availableStorageBytes)}) is below cutoff (${vault.storageCutoffGb.value} GB)"
+                }
+                postToast("Sync blocked: $reason")
+                val token = vault.pairingToken.value
+                if (token != null) {
+                    relayEngine.sendSafetyAlertToHub(
+                        token = token,
+                        deviceName = vault.getDeviceFriendlyName(),
+                        reason = reason,
+                        value = ""
+                    )
+                }
+                return@launch
+            }
+
             relayEngine.setPaused(false)
             val tasks = MediaAndQrEngine.scanEnabledBucketsForRelay(
                 appContext,
@@ -344,10 +445,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 vault.devicePriorityWeight.value
             )
             if (tasks.isEmpty()) {
-                _uiToastMessage.value = "No media files in folders"
+                postToast("No media files in selected folders")
             } else {
                 relayEngine.enqueueTasks(tasks, isUrgentInstantUpload = false)
-                _uiToastMessage.value = "Queued ${tasks.size} files"
+                refreshConnectedDevices()
+                postToast("Queued ${tasks.size} files for sync")
             }
         }
     }
@@ -358,27 +460,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun triggerUrgentInstantUpload(tasks: List<RelayQueueTask>, label: String) {
         viewModelScope.launch(Dispatchers.IO) {
             if (tasks.isEmpty()) {
-                _uiToastMessage.value = "No files in $label"
+                postToast("No files in $label")
                 return@launch
             }
             relayEngine.setPaused(false)
             relayEngine.enqueueTasks(tasks, isUrgentInstantUpload = true)
+            refreshConnectedDevices()
             relayEngine.logEvent(
                 "INFO",
                 "UrgentQueueJump",
                 "Express Priority-5 upload triggered for $label (${tasks.size} items)"
             )
-            _uiToastMessage.value = "Express upload queued: ${tasks.size} items"
+            postToast("Express upload queued: ${tasks.size} items")
         }
     }
 
     fun togglePauseResume() {
-        relayEngine.togglePause()
+        val isPaused = relayEngine.togglePause()
+        postToast(if (isPaused) "Sync Paused" else "Sync Resumed")
     }
 
     fun stopSync() {
         relayEngine.clearQueueAndStop()
-        _uiToastMessage.value = "Sync Stopped"
+        postToast("Sync Stopped")
     }
 
     fun removeFromQueue(filePath: String) {
@@ -399,23 +503,37 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun format12HourTime(hour: Int, minute: Int): String {
-        val h = if (hour == 0) 12 else if (hour > 12) hour - 12 else hour
-        val amPm = if (hour < 12) "AM" else "PM"
-        return String.format(Locale.US, "%02d:%02d %s", h, minute, amPm)
+        val safeHour = hour.coerceIn(0, 23)
+        val safeMinute = minute.coerceIn(0, 59)
+        val h = if (safeHour == 0) 12 else if (safeHour > 12) safeHour - 12 else safeHour
+        val amPm = if (safeHour < 12) "AM" else "PM"
+        return String.format(Locale.US, "%02d:%02d %s", h, safeMinute, amPm)
     }
 
     fun updateDailySchedule(hour: Int, minute: Int) {
         viewModelScope.launch(Dispatchers.IO) {
             vault.setDailySchedule(hour, minute)
-            SyncWorkers.scheduleDailyAutomatedSync(appContext)
+            SyncWorkers.scheduleDailyAutomatedSync(appContext, forceReenqueue = true)
             val delayMin = SyncWorkers.computeInitialDelayMillis(hour, minute) / 60_000L
             val formatted = format12HourTime(hour, minute)
             relayEngine.logEvent(
                 "INFO",
                 "Scheduler",
-                "Scheduled 12h automated sync for $formatted (in $delayMin mins)"
+                "Scheduled 24h automated sync for $formatted (in $delayMin mins)"
             )
-            _uiToastMessage.value = "Sync set for $formatted (starts in $delayMin min)"
+            val role = vault.deviceRole.value
+            val token = vault.pairingToken.value
+            val bandwidth = vault.daytimeLimitKbps.value
+            val now = vault.configTimestamp.value
+
+            // Global sync: update all devices in Room
+            dao.updateAllDevicesScheduleAndBandwidth(bandwidth, hour, minute, formatted, now)
+
+            if (role == DeviceRole.PRIMARY_SENDER && token != null) {
+                relayEngine.syncDeviceConfigToHub(token, "ALL", bandwidth, hour, minute, now)
+            }
+            refreshConnectedDevices()
+            postToast("Sync set for $formatted (starts in $delayMin min)")
         }
     }
 
@@ -423,21 +541,51 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             vault.setDaytimeLimitKbps(kbps)
             val label = if (kbps <= 0) "Unlimited (Full Speed)" else "${kbps / 1024} MB/s"
-            _uiToastMessage.value = "Bandwidth Limit: $label"
+            val role = vault.deviceRole.value
+            val token = vault.pairingToken.value
+            val hour = vault.scheduleHour.value
+            val minute = vault.scheduleMinute.value
+            val formatted = format12HourTime(hour, minute)
+            val now = vault.configTimestamp.value
+
+            // Global sync: update all devices in Room
+            dao.updateAllDevicesScheduleAndBandwidth(kbps, hour, minute, formatted, now)
+
+            if (role == DeviceRole.PRIMARY_SENDER && token != null) {
+                relayEngine.syncDeviceConfigToHub(token, "ALL", kbps, hour, minute, now)
+            }
+            refreshConnectedDevices()
+            postToast("Bandwidth Limit: $label")
+        }
+    }
+
+    fun setStorageCutoffGb(gb: Float) {
+        viewModelScope.launch(Dispatchers.IO) {
+            vault.setStorageCutoffGb(gb)
+            postToast("Storage cutoff threshold set to ${String.format(Locale.US, "%.1f", gb)} GB")
+        }
+    }
+
+    fun updateBandwidthThrottleWindow(startHour: Int, startMinute: Int, endHour: Int, endMinute: Int) {
+        viewModelScope.launch(Dispatchers.IO) {
+            vault.setThrottleWindow(startHour, startMinute, endHour, endMinute)
+            val startStr = format12HourTime(startHour, startMinute)
+            val endStr = format12HourTime(endHour, endMinute)
+            postToast("Throttle Window: $startStr to $endStr")
         }
     }
 
     fun setTempCutoff(temp: Float) {
         viewModelScope.launch(Dispatchers.IO) {
             vault.setTempCutoff(temp)
-            _uiToastMessage.value = "Thermal cutoff set to ${String.format(Locale.US, "%.1f", temp)}°C"
+            postToast("Thermal cutoff set to ${String.format(Locale.US, "%.1f", temp)}°C")
         }
     }
 
     fun setBatteryCutoff(percent: Int) {
         viewModelScope.launch(Dispatchers.IO) {
             vault.setBatteryCutoff(percent)
-            _uiToastMessage.value = "Battery cutoff set to $percent%"
+            postToast("Battery cutoff set to $percent%")
         }
     }
 
@@ -445,7 +593,37 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             dao.updateDeviceBandwidth(deviceId, bandwidthLimitKbps)
             val limitStr = if (bandwidthLimitKbps <= 0) "Unlimited" else "${bandwidthLimitKbps / 1024} MB/s"
-            _uiToastMessage.value = "Allocated $limitStr bandwidth for device"
+            postToast("Allocated $limitStr bandwidth for device")
+        }
+    }
+
+    fun updateDeviceSettings(
+        deviceId: String,
+        bandwidthLimitKbps: Int,
+        scheduleHour: Int,
+        scheduleMinute: Int
+    ) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val now = System.currentTimeMillis()
+            val scheduleStr = format12HourTime(scheduleHour, scheduleMinute)
+            
+            // Global sync: update settings for all devices
+            vault.setDaytimeLimitKbps(bandwidthLimitKbps)
+            vault.setDailySchedule(scheduleHour, scheduleMinute)
+            dao.updateAllDevicesScheduleAndBandwidth(bandwidthLimitKbps, scheduleHour, scheduleMinute, scheduleStr, now)
+
+            val role = vault.deviceRole.value
+            val token = vault.pairingToken.value
+
+            if (role == DeviceRole.PRIMARY_SENDER && token != null) {
+                relayEngine.syncDeviceConfigToHub(token, "ALL", bandwidthLimitKbps, scheduleHour, scheduleMinute, now)
+                SyncWorkers.scheduleDailyAutomatedSync(appContext, forceReenqueue = false)
+            } else if (role == DeviceRole.SECONDARY_HUB) {
+                relayEngine.markHubDeviceConfigUpdated(deviceId, now)
+            }
+            refreshConnectedDevices()
+            val limitStr = if (bandwidthLimitKbps <= 0) "Unlimited" else "${bandwidthLimitKbps / 1024f} MB/s"
+            postToast("Updated $limitStr • Daily Sync at $scheduleStr")
         }
     }
 
@@ -453,14 +631,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             val folderTasks = tasks.filter { it.bucketName.equals(folderName, ignoreCase = true) }
             if (folderTasks.isEmpty()) {
-                _uiToastMessage.value = "No files in $folderName to upload"
+                postToast("No files in $folderName to upload")
                 return@launch
             }
             relayEngine.clearQueueAndStop()
             relayEngine.setPaused(false)
             relayEngine.enqueueTasks(folderTasks, isUrgentInstantUpload = true)
             HubForegroundService.startOrUpdate(appContext)
-            _uiToastMessage.value = "Uploading ${folderTasks.size} files from $folderName only"
+            postToast("Uploading ${folderTasks.size} files from $folderName only")
         }
     }
 
@@ -468,7 +646,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             vault.setDevicePriorityWeight(weight)
             refreshMediaBuckets()
-            _uiToastMessage.value = "Device priority weight set to $weight"
+            postToast("Device priority weight set to $weight")
         }
     }
 
@@ -478,7 +656,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             if (enabled) {
                 HubForegroundService.startOrUpdate(appContext)
             }
-            _uiToastMessage.value = if (enabled) "Instant Camera Capture: Active" else "Instant Camera Capture: Disabled"
+            postToast(if (enabled) "Instant Camera Capture: Active" else "Instant Camera Capture: Disabled")
         }
     }
 
@@ -510,11 +688,65 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             val ok = vault.importConfigurationJson(rawJson)
             if (ok) {
-                SyncWorkers.scheduleDailyAutomatedSync(appContext)
+                SyncWorkers.scheduleDailyAutomatedSync(appContext, forceReenqueue = true)
                 refreshAllState()
-                _uiToastMessage.value = "Enterprise Configuration Imported Successfully"
+                postToast("Enterprise Configuration Imported Successfully")
             } else {
-                _uiToastMessage.value = "Invalid JSON Configuration Payload"
+                postToast("Invalid JSON Configuration Payload")
+            }
+        }
+    }
+
+    fun refreshConnectedDevices() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val role = vault.deviceRole.value
+            val token = vault.pairingToken.value
+            val myDeviceId = vault.getOrCreateDeviceId()
+            val myFriendlyName = vault.getDeviceFriendlyName()
+            val myScheduleHour = vault.scheduleHour.value
+            val myScheduleMinute = vault.scheduleMinute.value
+            val myBandwidth = vault.daytimeLimitKbps.value
+            val myTraffic = dao.getTotalSyncedBytes()
+
+            if (role == DeviceRole.PRIMARY_SENDER && token != null) {
+                val hubEndpoint = if (token.localIp.isNotBlank() && token.localIp != "0.0.0.0") token.localIp else token.tailscaleOrWanHost
+                val scheduleStr = format12HourTime(myScheduleHour, myScheduleMinute)
+                dao.upsertConnectedDevice(
+                    ConnectedDeviceEntity(
+                        deviceId = token.hubDeviceId.ifEmpty { "hub_${token.localIp}" },
+                        deviceName = token.hubDeviceName.ifEmpty { "AuraSync Hub" },
+                        ipAddress = "$hubEndpoint:${token.port}",
+                        role = "SECONDARY_HUB",
+                        scheduledSync = scheduleStr,
+                        scheduleHour = myScheduleHour,
+                        scheduleMinute = myScheduleMinute,
+                        bandwidthLimitKbps = myBandwidth,
+                        syncStatus = "Connected (Hub)",
+                        trafficBytes = myTraffic,
+                        lastSeen = System.currentTimeMillis()
+                    )
+                )
+                val peers = relayEngine.queryHubPeers(
+                    token = token,
+                    clientDeviceId = myDeviceId,
+                    clientDeviceName = myFriendlyName,
+                    scheduleHour = myScheduleHour,
+                    scheduleMinute = myScheduleMinute,
+                    bandwidthLimitKbps = myBandwidth,
+                    trafficBytes = myTraffic,
+                    clientConfigTimestamp = vault.configTimestamp.value
+                )
+                for (peer in peers) {
+                    dao.upsertConnectedDevice(peer)
+                    // If any peer on the Hub has newer settings, sync locally and globally
+                    if (peer.configUpdatedAt > vault.configTimestamp.value) {
+                        vault.setDaytimeLimitKbps(peer.bandwidthLimitKbps, updateTimestamp = false)
+                        vault.setDailySchedule(peer.scheduleHour, peer.scheduleMinute, updateTimestamp = false)
+                        vault.setConfigTimestamp(peer.configUpdatedAt)
+                        SyncWorkers.scheduleDailyAutomatedSync(appContext, forceReenqueue = true)
+                        dao.updateAllDevicesScheduleAndBandwidth(peer.bandwidthLimitKbps, peer.scheduleHour, peer.scheduleMinute, peer.scheduledSync, peer.configUpdatedAt)
+                    }
+                }
             }
         }
     }

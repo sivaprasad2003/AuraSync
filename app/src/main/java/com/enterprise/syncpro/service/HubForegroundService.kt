@@ -113,7 +113,7 @@ class HubForegroundService : Service() {
 
         val roleLabel = if (isHub) "Secondary Hub (Receiver)" else "Primary Node (Sender)"
         val progressPercent = (state.activeFileProgress * 100f).roundToInt().coerceIn(0, 100)
-        val speedFormatted = String.format("%.2f MB/s", state.currentSpeedMbps)
+        val speedFormatted = String.format(java.util.Locale.US, "%.2f MB/s", state.currentSpeedMbps)
         val bodyText = when {
             isSyncCompleted -> "Sync Completed • ${state.completedSessionFiles} files transferred"
             isSyncPaused -> "Sync Paused • Queue: ${state.queuedFileCount}"
@@ -123,11 +123,12 @@ class HubForegroundService : Service() {
         }
 
         val notification = buildTelemetryNotification(
-            title = if (isSyncCompleted) "AuraSync • Completed" else "AuraSync • $roleLabel",
+            title = if (isSyncCompleted) "AuraSync • Sync Completed" else "AuraSync • $roleLabel",
             statusText = bodyText,
             progress = progressPercent,
             isIndeterminate = !isSyncActive && !isSyncPaused && !isSyncCompleted,
-            isPaused = isSyncPaused
+            isPaused = isSyncPaused,
+            isCompleted = isSyncCompleted
         )
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -192,11 +193,12 @@ class HubForegroundService : Service() {
                 }
 
                 val updatedNotification = buildTelemetryNotification(
-                    title = if (isSyncCompleted) "AuraSync • Completed" else "AuraSync • $roleLabel",
+                    title = if (isSyncCompleted) "AuraSync • Sync Completed" else "AuraSync • $roleLabel",
                     statusText = bodyText,
                     progress = progressPercent,
                     isIndeterminate = false,
-                    isPaused = isSyncPaused
+                    isPaused = isSyncPaused,
+                    isCompleted = isSyncCompleted
                 )
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -331,10 +333,13 @@ class HubForegroundService : Service() {
         statusText: String,
         progress: Int,
         isIndeterminate: Boolean,
-        isPaused: Boolean
+        isPaused: Boolean,
+        isCompleted: Boolean = false
     ): Notification {
         val openAppIntent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            action = Intent.ACTION_MAIN
+            addCategory(Intent.CATEGORY_LAUNCHER)
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
         }
         val contentPendingIntent = PendingIntent.getActivity(
             this,
@@ -379,22 +384,28 @@ class HubForegroundService : Service() {
         val pauseActionLabel = if (isPaused) "Resume" else "Pause"
 
         val builder = NotificationCompat.Builder(this, CHANNEL_ID_RELAY)
-            .setSmallIcon(android.R.drawable.stat_sys_upload)
+            .setSmallIcon(if (isCompleted) android.R.drawable.stat_sys_upload_done else android.R.drawable.stat_sys_upload)
             .setContentTitle(title)
             .setContentText(statusText)
             .setStyle(NotificationCompat.BigTextStyle().bigText(statusText))
             .setContentIntent(contentPendingIntent)
-            .setOngoing(true)
+            .setOngoing(!isCompleted)
+            .setAutoCancel(isCompleted)
             .setOnlyAlertOnce(true)
-            .setProgress(100, progress, isIndeterminate)
 
-        if (isTransferring) {
-            builder.addAction(android.R.drawable.ic_media_pause, pauseActionLabel, pauseResumePending)
-            builder.addAction(android.R.drawable.ic_delete, "Stop", stopSyncPending)
+        if (isCompleted) {
+            builder.setProgress(0, 0, false)
+            builder.addAction(android.R.drawable.ic_lock_power_off, "Exit", exitPending)
         } else {
-            builder.addAction(android.R.drawable.ic_popup_sync, "Sync Now", syncNowPending)
+            builder.setProgress(100, progress, isIndeterminate)
+            if (isTransferring) {
+                builder.addAction(android.R.drawable.ic_media_pause, pauseActionLabel, pauseResumePending)
+                builder.addAction(android.R.drawable.ic_delete, "Stop", stopSyncPending)
+            } else {
+                builder.addAction(android.R.drawable.ic_popup_sync, "Sync Now", syncNowPending)
+            }
+            builder.addAction(android.R.drawable.ic_lock_power_off, "Exit", exitPending)
         }
-        builder.addAction(android.R.drawable.ic_lock_power_off, "Exit", exitPending)
 
         return builder.build()
     }
@@ -502,7 +513,9 @@ class SyncNotificationReceiver : BroadcastReceiver() {
                     networkMonitor.stopMdnsDiscovery()
                     val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
                     notificationManager.cancelAll()
-                    android.os.Process.killProcess(android.os.Process.myPid())
+                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                        android.os.Process.killProcess(android.os.Process.myPid())
+                    }, 500)
                 }
             }
             Intent.ACTION_BOOT_COMPLETED -> {
