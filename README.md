@@ -1,6 +1,7 @@
 # ⚡ AuraSync — Enterprise P2P Media Relay & Unlimited Google Photos Hub Engine
 
 [![Platform](https://img.shields.io/badge/Platform-Android%208.0%2B%20(API%2026%2B)-00E676?style=for-the-badge&logo=android&logoColor=white)](https://developer.android.com)
+[![GitHub Release](https://img.shields.io/github/v/release/sivaprasad2003/AuraSync?color=00E676&style=for-the-badge)](https://github.com/sivaprasad2003/AuraSync/releases)
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.3%2B-6366F1?style=for-the-badge&logo=kotlin&logoColor=white)](https://kotlinlang.org)
 [![Jetpack Compose](https://img.shields.io/badge/UI-Jetpack%20Compose%20(Material%203)-00E676?style=for-the-badge&logo=jetpackcompose&logoColor=white)](https://developer.android.com/jetpack/compose)
 [![Telegram Community](https://img.shields.io/badge/Telegram-Join%20AuraSync-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/AuraSyncapp)
@@ -11,6 +12,49 @@
 Built with **Kotlin, Jetpack Compose (Material 3), Room Database, and WorkManager**, AuraSync operates with zero cloud intermediaries, strict 64KB chunked socket streaming, end-to-end encryption (E2EE), and two-tier cryptographic SHA-256 deduplication.
 
 ---
+
+---
+
+## 📦 Releases & Downloads
+
+| Release | Universal Production APK | Changes | Status |
+|---|---|---|---|
+| **v1.0.0** | [Download APK (GitHub Releases)](https://github.com/sivaprasad2003/AuraSync/releases/tag/v1.0.0) | Production hardening, security overhaul, 10 bug fixes, UI polish | 🟢 Stable / Production |
+
+### 🚀 What's New in v1.0.0 (Production Hardening & Audit Release)
+
+#### 🟡 Security Hardening
+- **PBKDF2 Cryptographic Salt & Hashing:** Upgraded vault PIN storage from single-iteration SHA-256 to `PBKDF2WithHmacSHA256` with 310,000 iterations and a 16-byte cryptographically secure salt. Automatic on-the-fly migration upgrades legacy PIN hashes seamlessly upon verification.
+- **Brute-Force Rate Limiting & Lockout:** Enforced exponential lockout after 5 consecutive failed PIN attempts, backed by persistent timestamp storage and a live countdown banner in the UI to prevent brute-force attacks.
+- **mDNS Network Privacy:** Sanitized mDNS TXT broadcast records to completely remove plaintext pre-shared secrets (`secretHex`) and PIN hashes (`pinHash`), preventing LAN eavesdropping.
+- **Domain-Separated AES-CTR IVs:** Implemented strict domain separation for AES-CTR initialization vectors (`AuraSync-CTR-IV-v1:$fileSha256`), preventing keystream reuse across files.
+- **Network Security Configuration:** Created `network_security_config.xml` to strictly forbid cleartext traffic for WAN and public internet destinations, while selectively allowlisting private local LAN subnets and Tailscale CGNAT IP ranges (`100.64.0.0/10`).
+- **Release Credential Isolation:** Decoupled release keystore signing credentials from version-controlled `build.gradle.kts` into untracked `local.properties`.
+- **E2EE Export Disclaimers:** Added cryptographic warnings to configuration export and import dialogs to warn users about sensitive token handling.
+
+#### 🔴 Critical Bug Fixes
+- **Non-Destructive Room Migrations:** Implemented explicit Room `MIGRATION_5_6` and fallback migration paths, safeguarding the local synced files database and transfer queue across app updates without destructive resets.
+- **PIN Verification vs Initialization Isolation:** Separated PIN setup logic from verification in `VaultManager`, ensuring an uninitialized vault is never accidentally locked with an unconfirmed PIN.
+- **12-Hour Time Formatter Coercion:** Bound user-selected hours (`0..23`) and minutes (`0..59`) in `MainViewModel` to prevent midnight formatting bugs (`12:00 PM` vs `12:00 AM`).
+- **Graceful Process Termination:** Removed abrupt `android.os.Process.killProcess()` calls from the UI exit action, adding a clean 500ms delay in `HubForegroundService` so teardown broadcasts execute cleanly.
+- **Battery-Saving Telemetry Polling:** Slowed aggressive 2.5s hardware safety monitoring loop to 30s, reducing idle battery and CPU consumption.
+- **Hub Socket & mDNS Broadcast Consistency:** Aligned mDNS broadcast call signatures across `MainViewModel` and `RelayTransferEngine`.
+
+#### 🟠 UI & UX Polish
+- **Material 3 TimePicker:** Modernized the sync schedule dialog by replacing legacy Android 5.0 `TimePickerDialog` with a Material 3 Compose `TimePicker`.
+- **Directional Slide & Fade Tab Navigation:** Added smooth horizontal slide and fade transitions based on tab index order when navigating between Dashboard, Folders, and Network tabs.
+- **Tactile Haptic Feedback:** Added long-press haptic feedback to primary action buttons (*Sync Now*, *Pause*, *Resume*, *Stop*).
+- **Empty State Illustrators:** Added vector-illustrated empty states for both Folders and Transfer Queue screens with actionable guidance.
+- **Progress Bar Rounding Compatibility:** Added `strokeCap = StrokeCap.Round` across all `LinearProgressIndicator` instances for consistent rendering on older Android versions.
+- **Theme Color Fixes:** Replaced hardcoded `Color.White` on the Paired Hub card with adaptive `MaterialTheme.colorScheme.onSurface` for optimal light and dark theme contrast.
+- **Hub Port Indicator Accuracy:** Fixed displayed hub port indicator from 8989 to the canonical `DEFAULT_HUB_PORT` (49210).
+
+#### 🟢 Features & Quality of Life
+- **Vault PIN Change Flow:** Added dedicated PIN change workflow requiring verification of the current PIN before setting a new one.
+- **Instant Vault Lock:** Added an on-demand manual "Lock" button in the Network & Vault header.
+- **System Theme Auto-Detection:** Automatically matches system dark/light theme preference on initial installation.
+- **WorkManager Update Policy:** Upgraded periodic synchronization scheduling from `CANCEL_AND_REENQUEUE` to `ExistingPeriodicWorkPolicy.UPDATE`.
+- **Idiomatic Kotlin Math:** Replaced Java `Math` calls with standard Kotlin math utilities.
 
 ## 🎯 Why AuraSync Was Made (Purpose & Motivation)
 
